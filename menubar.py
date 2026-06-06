@@ -306,6 +306,69 @@ if(el){el.value='';el.placeholder='Cleared — save to confirm'}
 
 let settings={};
 
+// Provider status
+let providerStatus={};
+
+async function loadProviders(){
+try{
+const r=await fetch(API+'/api/providers',{headers:{'Authorization':'Bearer '+pywebview.api.get_token()}});
+providerStatus=await r.json();
+updateProviderDropdowns();
+}catch(e){console.error('Load providers error:',e)}
+}
+
+function updateProviderDropdowns(){
+// STT
+const sttSelect=document.getElementById('set-STT_PROVIDER');
+if(sttSelect){
+const currentVal=sttSelect.value;
+sttSelect.innerHTML='';
+Object.entries(providerStatus).filter(([k,v])=>v.type==='stt').forEach(([k,v])=>{
+const opt=document.createElement('option');
+opt.value=k;
+const status=v.installed?'✓':'✗ needs install';
+const rec=v.recommended?' ⭐':'';
+opt.textContent=`${v.name} (${v.backend}, ${status})${rec}`;
+if(!v.installed)opt.style.color='#f87171';
+if(k===currentVal)opt.selected=true;
+sttSelect.appendChild(opt);
+});
+sttSelect.onchange=()=>autoInstall(sttSelect.value);
+}
+// TTS
+const ttsSelect=document.getElementById('set-TTS_PROVIDER');
+if(ttsSelect){
+const currentVal=ttsSelect.value;
+ttsSelect.innerHTML='';
+Object.entries(providerStatus).filter(([k,v])=>v.type==='tts').forEach(([k,v])=>{
+const opt=document.createElement('option');
+opt.value=k;
+const status=v.installed?'✓':'✗ needs install';
+const rec=v.recommended?' ⭐':'';
+opt.textContent=`${v.name} (${v.backend}, ${status})${rec}`;
+if(!v.installed)opt.style.color='#f87171';
+if(k===currentVal)opt.selected=true;
+ttsSelect.appendChild(opt);
+});
+ttsSelect.onchange=()=>autoInstall(ttsSelect.value);
+}
+}
+
+async function autoInstall(providerId){
+const p=providerStatus[providerId];
+if(!p||p.installed)return;
+if(!confirm(`${p.name} is not installed. Install now?`))return;
+try{
+const r=await fetch(API+'/api/providers/install',{
+method:'POST',headers:HEADERS,body:JSON.stringify({provider:providerId})
+});
+const d=await r.json();
+toast(`Installing ${p.name}...`,'success');
+// Poll for completion
+setTimeout(()=>loadProviders(),10000);
+}catch(e){toast('Install failed: '+e,'error')}
+}
+
 async function loadSettings(){
 try{
 const r=await fetch(API+'/api/settings',{headers:{'Authorization':'Bearer '+pywebview.api.get_token()}});
@@ -433,6 +496,7 @@ pywebview.api.on_saved();
 }
 
 loadSettings();
+loadProviders();
 </script></body></html>"""
 
 # ═══════════════════════════════════════════════════════════════════

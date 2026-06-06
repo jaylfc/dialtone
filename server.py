@@ -28,6 +28,7 @@ import functools
 import uuid
 from pathlib import Path
 from datetime import datetime
+from provider_registry import PROVIDER_DEPS, check_provider_installed, get_provider_status
 
 import requests as http_requests
 from flask import Flask, request, Response, jsonify
@@ -850,6 +851,7 @@ def serve_voicemail_audio(sid):
 STT_PROVIDERS = [
     # Cloud
     {"id": "deepgram", "name": "Deepgram Nova-3", "type": "cloud", "cost": "$0.29/hr", "recommended": True},
+    {"id": "mimo-stt", "name": "MiMo 2.5 STT", "type": "cloud", "cost": "Free", "recommended": True},
     {"id": "assemblyai", "name": "AssemblyAI Universal-3", "type": "cloud", "cost": "$0.21/hr"},
     {"id": "google", "name": "Google Cloud STT", "type": "cloud", "cost": "$0.96/hr"},
     {"id": "azure", "name": "Azure Speech", "type": "cloud", "cost": "$1.00/hr"},
@@ -876,7 +878,7 @@ TTS_PROVIDERS = [
     {"id": "deepgram_aura", "name": "Deepgram Aura", "type": "cloud", "cost": "$0.03/1K chars"},
     {"id": "fish", "name": "Fish Audio", "type": "cloud", "cost": "~$0.03/min"},
     {"id": "edge", "name": "Edge TTS (free)", "type": "cloud", "cost": "Free"},
-    {"id": "mimo", "name": "MiMo TTS", "type": "cloud", "cost": "Free"},
+    {"id": "mimo", "name": "MiMo 2.5 TTS", "type": "cloud", "cost": "Free", "recommended": True},
     # Local / Offline
     {"id": "kokoro", "name": "Kokoro 82M (MLX)", "type": "local", "cost": "Free", "recommended": True},
     {"id": "piper", "name": "Piper (C++, lightweight)", "type": "local", "cost": "Free"},
@@ -1111,6 +1113,59 @@ DASHBOARD_HTML = open(Path(__file__).parent / "dashboard.html").read() if (Path(
 @dashboard_app.route("/", methods=["GET"])
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
+
+# ═══════════════════════════════════════════════════════════════════
+# Provider Management API
+# ═══════════════════════════════════════════════════════════════════
+
+@dashboard_app.route("/api/providers", methods=["GET"])
+def list_providers():
+    """Get installation status of all STT/TTS providers."""
+    return jsonify(get_provider_status())
+
+@dashboard_app.route("/api/providers/install", methods=["POST"])
+def install_provider():
+    """Auto-install a provider's dependencies."""
+    data = request.json or {}
+    provider_id = data.get("provider", "")
+    
+    if provider_id not in PROVIDER_DEPS:
+        return jsonify({"error": f"Unknown provider: {provider_id}"}), 400
+    
+    provider = PROVIDER_DEPS[provider_id]
+    install_cmd = provider.get("pip_install") or provider.get("install_cmd")
+    
+    if not install_cmd:
+        return jsonify({"status": "ok", "message": "No install needed"})
+    
+    # Run install in background thread
+    def do_install():
+        import subprocess
+        try:
+            result = subprocess.run(
+                install_cmd.split(),
+                capture_output=True, text=True, timeout=300
+            )
+            print(f"Install {provider_id}: {'OK' if result.returncode == 0 else 'FAILED'}")
+            if result.returncode != 0:
+                print(f"  stderr: {result.stderr[:500]}")
+        except Exception as e:
+            print(f"Install {provider_id} failed: {e}")
+    
+    threading.Thread(target=do_install, daemon=True).start()
+    return jsonify({"status": "installing", "command": install_cmd})
+
+@dashboard_app.route("/api/providers/models", methods=["GET"])
+def list_provider_models():
+    """List available models for a provider."""
+    provider_id = request.args.get("provider", "")
+    if provider_id not in PROVIDER_DEPS:
+        return jsonify({"error": "Unknown provider"}), 400
+    
+    provider = PROVIDER_DEPS[provider_id]
+    models = provider.get("models", {})
+    return jsonify({"models": models})
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Main — run both servers

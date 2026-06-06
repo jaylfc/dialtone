@@ -207,6 +207,9 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
 
 # Call Settings
 CALL_GOAL=Have a helpful conversation.
+
+# Dashboard security (auto-generated)
+DASHBOARD_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 EOF
 
 echo -e "${GREEN}  ✅ Configuration saved to $ENV_FILE${NC}"
@@ -371,8 +374,12 @@ echo -e "  ${GREEN}Voicemails:${NC} $INSTALL_DIR/voicemails/"
 echo ""
 echo -e "  ${CYAN}Menu bar:${NC} Look for 📞 in your menu bar"
 echo -e "  ${CYAN}PIN:${NC}      $VOICEMAIL_PIN (callers dial this to reach AI)"
+echo -e "  ${CYAN}Dashboard token:${NC} Check .env (DASHBOARD_TOKEN)"
 echo ""
 echo -e "  ${YELLOW}Call ${TWILIO_PHONE} to test!${NC}"
+echo ""
+echo -e "  ${YELLOW}🔒 Dashboard is protected by token auth.${NC}"
+echo -e "  ${YELLOW}   Use the DASHBOARD_TOKEN from .env to login.${NC}"
 echo ""
 echo -e "  Manage services:"
 echo -e "    launchctl stop com.hermes-phone.server"

@@ -26,8 +26,29 @@ AGENT_DIR = Path(__file__).parent
 HEALTH_URL = "http://localhost:5050/health"
 VOICEMAILS_URL = "http://localhost:5050/voicemails"
 SETTINGS_URL = "http://localhost:5050/api/settings"
+CALL_URL = "http://localhost:5050/call"
 CHECK_INTERVAL = 10
 SERVICE_LABEL = "com.hermes-phone.server"
+
+# Read dashboard token from .env for API auth
+def _load_dashboard_token():
+    """Load DASHBOARD_TOKEN from .env file."""
+    env_path = AGENT_DIR / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("DASHBOARD_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+DASHBOARD_TOKEN = _load_dashboard_token()
+
+def api_headers():
+    """Headers for authenticated API calls."""
+    if DASHBOARD_TOKEN:
+        return {"Authorization": f"Bearer {DASHBOARD_TOKEN}"}
+    return {}
 
 TITLE = "📞"
 
@@ -213,7 +234,7 @@ class HermesPhoneApp(rumps.App):
 
     def _fetch_voicemails(self):
         try:
-            r = requests.get(VOICEMAILS_URL, timeout=5)
+            r = requests.get(VOICEMAILS_URL, headers=api_headers(), timeout=5)
             if r.status_code == 200:
                 self.voicemails = r.json()
         except:
@@ -292,7 +313,7 @@ class HermesPhoneApp(rumps.App):
         sid = vm.get("sid", "")
         if sid:
             try:
-                requests.delete(f"{VOICEMAILS_URL}/{sid}", timeout=5)
+                requests.delete(f"{VOICEMAILS_URL}/{sid}", headers=api_headers(), timeout=5)
                 rumps.notification(TITLE, "", "Voicemail deleted")
                 self._fetch_voicemails()
                 self._update_voicemail_menu()
@@ -329,8 +350,9 @@ class HermesPhoneApp(rumps.App):
             return
         try:
             r = requests.post(
-                "http://localhost:5050/call",
+                CALL_URL,
                 json={"to": number},
+                headers=api_headers(),
                 timeout=10,
             )
             if r.status_code == 200:
@@ -352,7 +374,7 @@ class HermesPhoneApp(rumps.App):
     def _fetch_settings(self):
         """Fetch current settings from API."""
         try:
-            r = requests.get(SETTINGS_URL, timeout=5)
+            r = requests.get(SETTINGS_URL, headers=api_headers(), timeout=5)
             if r.status_code == 200:
                 self.settings = r.json()
         except:
@@ -364,6 +386,7 @@ class HermesPhoneApp(rumps.App):
             r = requests.post(
                 SETTINGS_URL,
                 json={key: value},
+                headers=api_headers(),
                 timeout=5,
             )
             if r.status_code == 200:

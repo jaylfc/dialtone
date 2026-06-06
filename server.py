@@ -2,7 +2,11 @@
 Hermes Phone — AI-powered VoIP server for macOS.
 
 Architecture:
-  Twilio (audio) → WebSocket → Deepgram (STT) → LLM (OpenAI-compatible) → TTS → Twilio (playback)
+  Twilio (audio) → WebSocket → Deepgram (STT) → Hermes Agent (LLM + tools + memory) → TTS → Twilio
+
+Two ports:
+  5050 — Public webhook server (Twilio calls, no auth)
+  5051 — Protected dashboard + API (token auth required)
 
 Incoming calls: Greeting → PIN gate → AI conversation or voicemail
 Outgoing calls: POST /call → Twilio → AI conversation
@@ -18,6 +22,10 @@ import audioop
 import threading
 import tempfile
 import subprocess
+import hmac
+import secrets
+import functools
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -26,122 +34,234 @@ from flask import Flask, request, Response, jsonify
 from flask_sock import Sock
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
-from openai import OpenAI
 
 # ═══════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════
 
-# Load .env file
 ENV_FILE = Path(__file__).parent / ".env"
-if ENV_FILE.exists():
-    with open(ENV_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key.strip(), value)
+
+def load_env():
+    """Load .env file into os.environ."""
+    if ENV_FILE.exists():
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    value = value.strip().strip('"').strip("'")
+                    os.environ.setdefault(key.strip(), value)
+
+load_env()
+
+def env(key, default=""):
+    return os.environ.get(key, default)
 
 # Twilio
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM = os.environ.get("TWILIO_PHONE_NUMBER", "")
+TWILIO_SID = env("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = env("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = env("TWILIO_PHONE_NUMBER")
 
 # Deepgram (STT)
-DEEPGRAM_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+DEEPGRAM_KEY = env("DEEPGRAM_API_KEY")
 
-# LLM Provider
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-XIAOMI_KEY = os.environ.get("XIAOMI_API_KEY", "")
-XIAOMI_BASE_URL = os.environ.get("XIAOMI_BASE_URL", "https://token-plan-ams.xiaomimimo.com/v1")
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# Hermes Gateway (LLM — wraps the Hermes agent)
+HERMES_GATEWAY_URL = env("HERMES_GATEWAY_URL", "http://127.0.0.1:8642")
+HERMES_GATEWAY_TOKEN = env("HERMES_GATEWAY_TOKEN")
+
+# Model override (use specific model instead of agent default)
+HERMES_MODEL_OVERRIDE = env("HERMES_MODEL_OVERRIDE")
+
+# Legacy LLM (fallback if Hermes Gateway not available)
+LLM_PROVIDER = env("LLM_PROVIDER", "xiaomi")
+LLM_MODEL = env("LLM_MODEL", "mimo-v2.5")
+XIAOMI_KEY = env("XIAOMI_API_KEY")
+XIAOMI_BASE_URL = env("XIAOMI_BASE_URL", "https://token-plan-ams.xiaomimimo.com/v1")
+OPENAI_KEY = env("OPENAI_API_KEY")
+OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENROUTER_KEY = env("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Phone Agent
-VOICEMAIL_PIN = os.environ.get("VOICEMAIL_PIN", "1234")
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "My Company")
-VOICEMAIL_EMAIL = os.environ.get("VOICEMAIL_EMAIL", "")
-VOICEMAIL_MAX_LENGTH = int(os.environ.get("VOICEMAIL_MAX_LENGTH", "120"))
-VOICEMAIL_GREETING = os.environ.get("VOICEMAIL_GREETING", "")
-TTS_VOICE = os.environ.get("TTS_VOICE", "Polly.Amy")
-TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "en-GB")
-CALL_GOAL = os.environ.get("CALL_GOAL", "Have a helpful conversation.")
-SYSTEM_PROMPT = os.environ.get("CALL_SYSTEM_PROMPT", "")
+VOICEMAIL_PIN = env("VOICEMAIL_PIN", "1234")
+COMPANY_NAME = env("COMPANY_NAME", "My Company")
+VOICEMAIL_EMAIL = env("VOICEMAIL_EMAIL")
+VOICEMAIL_MAX_LENGTH = int(env("VOICEMAIL_MAX_LENGTH", "120"))
+VOICEMAIL_GREETING = env("VOICEMAIL_GREETING")
+TTS_VOICE = env("TTS_VOICE", "Polly.Brian")
+TTS_LANGUAGE = env("TTS_LANGUAGE", "en-GB")
+CALL_GOAL = env("CALL_GOAL", "Have a helpful conversation.")
+SYSTEM_PROMPT = env("CALL_SYSTEM_PROMPT")
 
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Telegram
+TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
+
+# Dashboard auth
+DASHBOARD_TOKEN = env("DASHBOARD_TOKEN")
+AUTH_COOKIE = "hp_auth"
+
+# Webhook URL override (use if behind a proxy or different URL)
+WEBHOOK_URL_OVERRIDE = env("WEBHOOK_URL_OVERRIDE")
+
+# Voice engine
+USE_LOCAL_VOICE = env("USE_LOCAL_VOICE", "auto").lower()
+# ═══════════════════════════════════════════════════════════════════
+# STT Provider Configuration
+# ═══════════════════════════════════════════════════════════════════
+# Options: deepgram, assemblyai, google, azure, whisper, groq, speechmatics, local
+STT_PROVIDER = env("STT_PROVIDER", "deepgram")
+# Provider-specific API keys
+ASSEMBLYAI_API_KEY = env("ASSEMBLYAI_API_KEY")
+GOOGLE_STT_CREDENTIALS = env("GOOGLE_STT_CREDENTIALS")  # Path to JSON key file
+AZURE_SPEECH_KEY = env("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = env("AZURE_SPEECH_REGION")
+GROQ_API_KEY = env("GROQ_API_KEY")
+SPEECHMATICS_API_KEY = env("SPEECHMATICS_API_KEY")
+
+# ═══════════════════════════════════════════════════════════════════
+# TTS Provider Configuration
+# ═══════════════════════════════════════════════════════════════════
+# Options: polly, elevenlabs, openai, azure, google, cartesia, deepgram_aura, kokoro, edge, mimo
+TTS_PROVIDER = env("TTS_PROVIDER", "polly")
+# Provider-specific API keys
+ELEVENLABS_API_KEY = env("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = env("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel
+CARTESIA_API_KEY = env("CARTESIA_API_KEY")
+CARTESIA_VOICE_ID = env("CARTESIA_VOICE_ID")
+AZURE_TTS_KEY = env("AZURE_TTS_KEY")
+AZURE_TTS_REGION = env("AZURE_TTS_REGION")
+GOOGLE_TTS_CREDENTIALS = env("GOOGLE_TTS_CREDENTIALS")
+
+
+
+# Ports
+WEBHOOK_PORT = int(env("WEBHOOK_PORT", "5050"))
+DASHBOARD_PORT = int(env("DASHBOARD_PORT", "5051"))
 
 # Data directory
 DATA_DIR = Path(__file__).parent / "voicemails"
 AUDIO_DIR = DATA_DIR / "audio"
 METADATA_FILE = DATA_DIR / "metadata.json"
-
-# ═══════════════════════════════════════════════════════════════════
-# Initialize clients
-# ═══════════════════════════════════════════════════════════════════
-
-# Ensure data directories exist
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-# LLM client — try providers in order: Xiaomi → OpenRouter → OpenAI
-llm_client = None
-llm_base_url = OPENAI_BASE_URL
-llm_api_key = OPENAI_KEY
-
-if LLM_PROVIDER == "xiaomi" and XIAOMI_KEY:
-    llm_client = OpenAI(base_url=XIAOMI_BASE_URL, api_key=XIAOMI_KEY)
-    llm_base_url = XIAOMI_BASE_URL
-    llm_api_key = XIAOMI_KEY
-elif OPENROUTER_KEY:
-    llm_client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_KEY)
-    llm_base_url = OPENROUTER_BASE_URL
-    llm_api_key = OPENROUTER_KEY
-elif OPENAI_KEY:
-    llm_client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_KEY)
-    llm_base_url = OPENAI_BASE_URL
-    llm_api_key = OPENAI_KEY
-
 # ═══════════════════════════════════════════════════════════════════
-# Local Voice Engine (MLX on Apple Silicon)
+# Flask Apps — two ports
 # ═══════════════════════════════════════════════════════════════════
 
-USE_LOCAL_VOICE = os.environ.get("USE_LOCAL_VOICE", "auto").lower()
+webhook_app = Flask("webhook")
+dashboard_app = Flask("dashboard")
+dashboard_app.secret_key = secrets.token_hex(32)
+webhook_sock = Sock(webhook_app)
 
-voice_engine = None
-if USE_LOCAL_VOICE in ("auto", "true", "1"):
-    try:
-        from local_voice import VoiceEngine
-        prefer_local = USE_LOCAL_VOICE != "false"
-        voice_engine = VoiceEngine(prefer_local=prefer_local)
-        print(f"  Voice: {voice_engine.mode}")
-    except Exception as e:
-        if USE_LOCAL_VOICE == "true":
-            print(f"  ❌ Local voice failed: {e}")
-        else:
-            print(f"  ℹ️ Local voice not available, using cloud TTS")
+# ═══════════════════════════════════════════════════════════════════
+# Auth helpers (dashboard only)
+# ═══════════════════════════════════════════════════════════════════
 
-# Deepgram client (fallback STT if local not available)
-dg_client = None
-if DEEPGRAM_KEY and (not voice_engine or not voice_engine.stt):
-    try:
-        from deepgram import DeepgramClient
-        dg_client = DeepgramClient(api_key=DEEPGRAM_KEY)
-    except ImportError:
-        print("⚠️ Deepgram SDK not installed — STT disabled")
+def check_auth(token):
+    if not DASHBOARD_TOKEN:
+        return True  # No token set = no auth (first run)
+    return hmac.compare_digest(token, DASHBOARD_TOKEN)
 
-# Flask app
-app = Flask(__name__)
-sock = Sock(app)
+def get_auth_headers():
+    """Headers for outbound API calls to Hermes Gateway."""
+    if HERMES_GATEWAY_TOKEN:
+        return {"Authorization": f"Bearer {HERMES_GATEWAY_TOKEN}"}
+    return {}
 
-# Call state (in-memory)
+# Login page HTML
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>📞 Hermes Phone — Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-card{background:#1a1a1a;border:1px solid #333;border-radius:16px;padding:40px;width:100%;max-width:380px}
+.login-card h1{font-size:24px;text-align:center;margin-bottom:8px}
+.login-card .sub{text-align:center;color:#888;font-size:14px;margin-bottom:32px}
+.fg{margin-bottom:20px}
+.fg label{display:block;font-size:13px;color:#888;margin-bottom:6px;font-weight:500}
+.fg input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#111;color:#e0e0e0;font-size:15px;font-family:monospace;letter-spacing:2px;text-align:center}
+.fg input:focus{outline:none;border-color:#3b82f6}
+.btn{width:100%;padding:12px;border-radius:8px;border:none;background:#1d4ed8;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+.btn:hover{background:#2563eb}
+.error{background:#7f1d1d;color:#fca5a5;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;text-align:center;display:none}
+.hint{text-align:center;color:#555;font-size:12px;margin-top:16px}
+</style></head><body>
+<div class="login-card">
+<h1>📞 Hermes Phone</h1>
+<div class="sub">Enter your dashboard token</div>
+<div class="error" id="error">Invalid token</div>
+<form onsubmit="return doLogin(event)">
+<div class="fg"><label>Access Token</label><input type="password" id="token" placeholder="••••••••••••••••" autofocus></div>
+<button type="submit" class="btn">🔓 Login</button>
+</form>
+<div class="hint">Find the token in your .env as DASHBOARD_TOKEN</div>
+</div>
+<script>
+async function doLogin(e){
+e.preventDefault();
+const t=document.getElementById('token').value;
+if(!t)return false;
+try{
+const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+const d=await r.json();
+if(d.status==='ok'){window.location='/'}else{document.getElementById('error').style.display='block'}
+}catch(e){document.getElementById('error').style.display='block'}
+return false}
+</script></body></html>"""
+
+# Dashboard auth middleware
+@dashboard_app.before_request
+def require_dashboard_auth():
+    path = request.path
+    if path in ("/login", "/logout", "/health"):
+        return None
+    cookie = request.cookies.get(AUTH_COOKIE, "")
+    if check_auth(cookie):
+        return None
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and check_auth(auth[7:]):
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"error": "Unauthorized"}), 401
+    return Response(LOGIN_HTML, mimetype="text/html", status=401)
+
+# ═══════════════════════════════════════════════════════════════════
+# Shared state
+# ═══════════════════════════════════════════════════════════════════
+
 call_states = {}
 
-# Voicemail metadata
+# Voice engine (lazy init)
+voice_engine = None
+dg_client = None
+
+def init_voice_engine():
+    global voice_engine, dg_client
+    if USE_LOCAL_VOICE in ("auto", "true", "1"):
+        try:
+            from local_voice import VoiceEngine
+            voice_engine = VoiceEngine(prefer_local=USE_LOCAL_VOICE != "false")
+            print(f"  Voice: {voice_engine.mode}")
+        except Exception as e:
+            if USE_LOCAL_VOICE == "true":
+                print(f"  ❌ Local voice failed: {e}")
+            else:
+                print(f"  ℹ️  Local voice not available, using cloud TTS")
+
+    if DEEPGRAM_KEY and (not voice_engine or not voice_engine.stt):
+        try:
+            from deepgram import DeepgramClient
+            dg_client = DeepgramClient(api_key=DEEPGRAM_KEY)
+        except ImportError:
+            print("⚠️ Deepgram SDK not installed — STT disabled")
+
+# ═══════════════════════════════════════════════════════════════════
+# Voicemail helpers
+# ═══════════════════════════════════════════════════════════════════
+
 def load_voicemails():
     if METADATA_FILE.exists():
         return json.loads(METADATA_FILE.read_text())
@@ -149,6 +269,46 @@ def load_voicemails():
 
 def save_voicemails(voicemails):
     METADATA_FILE.write_text(json.dumps(voicemails, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Caller info helper
+# ═══════════════════════════════════════════════════════════════════
+
+def get_caller_info(form_data):
+    """Extract the best available caller info from Twilio webhook data.
+    
+    Checks (in order):
+    1. ForwardedFrom — original caller if call was forwarded
+    2. From — standard caller number
+    3. Caller — can differ in SIP/forwarding scenarios
+    4. CallerName — CNAM lookup (US only, requires VoiceCallerIdLookup)
+    """
+    forwarded = form_data.get("ForwardedFrom", "").strip()
+    from_num = form_data.get("From", "").strip()
+    caller_num = form_data.get("Caller", "").strip()
+    caller_name = form_data.get("CallerName", "").strip()
+    
+    # Anonymous/restricted indicators
+    blocked_indicators = ("anonymous", "restricted", "private", "unavailable", "unknown", "")
+    
+    # Prefer forwarded number (original caller in forwarding scenario)
+    if forwarded and forwarded.lower() not in blocked_indicators:
+        return forwarded
+    
+    # Standard From field
+    if from_num and from_num.lower() not in blocked_indicators:
+        return from_num
+    
+    # Caller field fallback
+    if caller_num and caller_num.lower() not in blocked_indicators:
+        return caller_num
+    
+    # CallerName (CNAM) — better display than number
+    if caller_name:
+        return caller_name
+    
+    return "Unknown Caller"
 
 # ═══════════════════════════════════════════════════════════════════
 # System prompt
@@ -170,42 +330,107 @@ Rules:
 - Say goodbye when the goal is achieved"""
 
 # ═══════════════════════════════════════════════════════════════════
-# LLM
+# Webhook URL helper
+# ═══════════════════════════════════════════════════════════════════
+
+def get_webhook_base():
+    """Get the public URL for Twilio webhooks."""
+    if WEBHOOK_URL_OVERRIDE:
+        return WEBHOOK_URL_OVERRIDE.rstrip("/")
+    return f"https://{request.host}"
+
+# ═══════════════════════════════════════════════════════════════════
+# LLM — Hermes Gateway (primary) or legacy fallback
 # ═══════════════════════════════════════════════════════════════════
 
 def get_llm_response(call_sid, user_text):
-    """Get response from LLM via OpenAI-compatible API."""
-    if not llm_client:
-        return "Sorry, I'm having technical difficulties."
-
-    state = call_states.setdefault(call_sid, {"messages": [], "transcript": []})
+    """Get response from LLM — prefers Hermes Gateway, falls back to direct API."""
+    state = call_states.setdefault(call_sid, {"messages": [], "transcript": [], "conversation_id": f"call-{call_sid}"})
     state["transcript"].append({"role": "user", "text": user_text})
 
+    # Try Hermes Gateway first
+    reply = _try_hermes_gateway(state, user_text)
+    if reply:
+        return _record_reply(state, reply)
+
+    # Fallback to legacy direct LLM
+    reply = _try_legacy_llm(state, user_text)
+    if reply:
+        return _record_reply(state, reply)
+
+    return "Sorry, I'm having technical difficulties."
+
+def _record_reply(state, reply):
+    state["transcript"].append({"role": "assistant", "text": reply})
+    return reply
+
+def _try_hermes_gateway(state, user_text):
+    """Call Hermes Gateway API with named conversation for stateful multi-turn."""
+    if not HERMES_GATEWAY_URL:
+        return None
+    try:
+        resp = http_requests.post(
+            f"{HERMES_GATEWAY_URL}/v1/responses",
+            headers={**get_auth_headers(), "Content-Type": "application/json"},
+            json={
+                "model": HERMES_MODEL_OVERRIDE or "default",
+                "input": user_text,
+                "conversation": state["conversation_id"],
+                "instructions": get_system_prompt(),
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Extract text from response
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for content in item.get("content", []):
+                        if content.get("type") == "output_text":
+                            return content["text"].strip()
+            # Fallback for chat completions format
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"].strip()
+            return None
+        else:
+            print(f"Hermes Gateway error: {resp.status_code} {resp.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"Hermes Gateway unavailable: {e}")
+        return None
+
+def _try_legacy_llm(state, user_text):
+    """Fallback: direct LLM provider call."""
+    from openai import OpenAI
+
+    client = None
+    model = LLM_MODEL
+    if LLM_PROVIDER == "xiaomi" and XIAOMI_KEY:
+        client = OpenAI(base_url=XIAOMI_BASE_URL, api_key=XIAOMI_KEY)
+    elif OPENROUTER_KEY:
+        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_KEY)
+    elif OPENAI_KEY:
+        client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_KEY)
+
+    if not client:
+        return None
+
     messages = [{"role": "system", "content": get_system_prompt()}]
-    messages.extend(state["messages"])
+    for m in state["messages"][-40:]:
+        messages.append(m)
     messages.append({"role": "user", "content": user_text})
 
     try:
-        resp = llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
+        resp = client.chat.completions.create(model=model, messages=messages, max_tokens=500, temperature=0.7)
         reply = resp.choices[0].message.content.strip()
-
         state["messages"].append({"role": "user", "content": user_text})
         state["messages"].append({"role": "assistant", "content": reply})
-        state["transcript"].append({"role": "assistant", "text": reply})
-
-        # Keep conversation history manageable
         if len(state["messages"]) > 40:
             state["messages"] = state["messages"][-40:]
-
         return reply
     except Exception as e:
-        print(f"LLM error: {e}")
-        return "I'm sorry, I missed that. Could you repeat?"
+        print(f"Legacy LLM error: {e}")
+        return None
 
 # ═══════════════════════════════════════════════════════════════════
 # TTS
@@ -213,16 +438,16 @@ def get_llm_response(call_sid, user_text):
 
 def synthesize_speech(text):
     """Convert text to audio using the best available TTS."""
-    # Try local MLX TTS first (free, fast, offline)
     if voice_engine and voice_engine.tts:
         audio = voice_engine.speak(text)
         if audio:
             return audio
 
-    # Try MiMo TTS (if using Xiaomi)
-    if LLM_PROVIDER == "xiaomi" and llm_client:
+    if LLM_PROVIDER == "xiaomi" and XIAOMI_KEY:
         try:
-            resp = llm_client.chat.completions.create(
+            from openai import OpenAI
+            client = OpenAI(base_url=XIAOMI_BASE_URL, api_key=XIAOMI_KEY)
+            resp = client.chat.completions.create(
                 model="mimo-v2.5-tts",
                 messages=[{"role": "assistant", "content": text}],
                 audio={"format": "pcm16", "voice": "Mia"},
@@ -235,54 +460,27 @@ def synthesize_speech(text):
         except Exception as e:
             print(f"MiMo TTS error: {e}")
 
-    # Fallback: OpenAI TTS (if key available)
-    if OPENAI_KEY:
-        try:
-            resp = http_requests.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-                json={"model": "tts-1", "input": text, "voice": "alloy"},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                # OpenAI returns MP3, convert to PCM
-                # For now, return None and let Twilio's <Say> handle it
-                pass
-        except Exception as e:
-            print(f"OpenAI TTS error: {e}")
-
     return None
-
-# ═══════════════════════════════════════════════════════════════════
-# Audio playback
-# ═══════════════════════════════════════════════════════════════════
 
 def send_audio_to_ws(ws, stream_sid, audio_data):
     """Send synthesized audio back to Twilio via WebSocket."""
     try:
-        # Skip WAV header if present
         if audio_data[:4] == b"RIFF":
             audio_data = audio_data[44:]
-
         mulaw = audioop.lin2ulaw(audio_data, 2)
-
-        chunk_size = 160  # 20ms at 8kHz
+        chunk_size = 160
         for i in range(0, len(mulaw), chunk_size):
             chunk = mulaw[i:i + chunk_size]
             if len(chunk) < chunk_size:
                 chunk += b"\xff" * (chunk_size - len(chunk))
             ws.send(json.dumps({
-                "event": "media",
-                "streamSid": stream_sid,
+                "event": "media", "streamSid": stream_sid,
                 "media": {"payload": base64.b64encode(chunk).decode()},
             }))
-
         ws.send(json.dumps({
-            "event": "mark",
-            "streamSid": stream_sid,
+            "event": "mark", "streamSid": stream_sid,
             "mark": {"name": f"resp_{int(time.time())}"},
         }))
-        print(f"🔊 Sent {len(mulaw)} bytes audio")
     except Exception as e:
         print(f"Audio send error: {e}")
 
@@ -291,31 +489,21 @@ def send_audio_to_ws(ws, stream_sid, audio_data):
 # ═══════════════════════════════════════════════════════════════════
 
 def notify_telegram(recording_url, caller, duration, transcription=""):
-    """Download voicemail and send to Telegram with transcript."""
     if not TELEGRAM_BOT_TOKEN:
         return
-
     try:
-        # Download recording from Twilio
         audio_url = f"{recording_url}.wav"
         r = http_requests.get(audio_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=30)
         if r.status_code != 200:
-            print(f"❌ Failed to download recording: {r.status_code}")
             return
-
-        # Save to temp file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(r.content)
             wav_path = f.name
 
-        # Transcribe with Deepgram if no Twilio transcript
         transcript_text = transcription
         if not transcript_text and dg_client:
             try:
-                from deepgram.options import PrerecordedOptions
-                with open(wav_path, "rb") as audio_file:
-                    buffer_data = audio_file.read()
-                payload = {"buffer": buffer_data}
+                payload = {"buffer": r.content}
                 options = {"model": "nova-2", "language": "en", "punctuate": True}
                 response = dg_client.listen.rest.v("1").transcribe_file(payload, options)
                 if response and response.results:
@@ -323,96 +511,56 @@ def notify_telegram(recording_url, caller, duration, transcription=""):
             except Exception as e:
                 print(f"⚠️ Deepgram transcription failed: {e}")
 
-        # Format caption
         caller_display = caller.replace("+", "")
         caption = f"📞 Voicemail from {caller_display}\n⏱️ {duration}s"
         if transcript_text:
             caption += f'\n\n📝 "{transcript_text}"'
 
-        # Send to Telegram
         tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVoice"
         with open(wav_path, "rb") as audio_file:
-            resp = http_requests.post(
-                tg_url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                files={"voice": ("voicemail.wav", audio_file, "audio/wav")},
-                timeout=30,
-            )
-
-        if resp.status_code == 200:
-            print(f"✅ Voicemail sent to Telegram")
-        else:
-            print(f"❌ Telegram send failed: {resp.status_code}")
-
-        # Cleanup
+            http_requests.post(tg_url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                              files={"voice": ("voicemail.wav", audio_file, "audio/wav")}, timeout=30)
         try:
             os.unlink(wav_path)
         except:
             pass
-
     except Exception as e:
         print(f"❌ Telegram notification error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════
-# Twilio Webhooks
+# WEBHOOK APP (port 5050 — public, no auth)
 # ═══════════════════════════════════════════════════════════════════
 
-@app.route("/voice/incoming", methods=["POST"])
+@webhook_app.route("/voice/incoming", methods=["POST"])
 def handle_incoming():
-    """Handle incoming call — greeting with PIN capture."""
     call_sid = request.form.get("CallSid", "unknown")
-    caller = request.form.get("From", "unknown")
+    caller = get_caller_info(request.form)
     print(f"📞 Incoming: {call_sid} from {caller}")
 
     resp = VoiceResponse()
+    greeting = VOICEMAIL_GREETING or f"Thank you for calling {COMPANY_NAME}. Please leave a message after the tone."
+    if not VOICEMAIL_GREETING and VOICEMAIL_EMAIL:
+        greeting += f" Or email us at {VOICEMAIL_EMAIL}."
 
-    # Build greeting — use custom or default
-    if VOICEMAIL_GREETING:
-        greeting = VOICEMAIL_GREETING
-    else:
-        greeting = f"Thank you for calling {COMPANY_NAME}. "
-        greeting += "Please leave a message after the tone."
-        if VOICEMAIL_EMAIL:
-            greeting += f" Or email us at {VOICEMAIL_EMAIL}."
-        else:
-            greeting += ""
-
-    # Play greeting while listening for PIN
-    gather = Gather(
-        num_digits=len(VOICEMAIL_PIN),
-        action="/voice/check-pin",
-        method="POST",
-        timeout=1,
-        finish_on_key="#",
-    )
+    gather = Gather(num_digits=len(VOICEMAIL_PIN), action="/voice/check-pin", method="POST",
+                    timeout=1, finish_on_key="#")
     gather.say(greeting, voice=TTS_VOICE, language=TTS_LANGUAGE)
     resp.append(gather)
 
-    # If no PIN entered → beep and record voicemail
-    resp.record(
-        action="/voice/voicemail-complete",
-        method="POST",
-        max_length=VOICEMAIL_MAX_LENGTH,
-        play_beep=True,
-        finish_on_key="#",
-        recording_status_callback="/voice/recording-ready",
-        recording_status_callback_method="POST",
-    )
-
+    resp.record(action="/voice/voicemail-complete", method="POST", max_length=VOICEMAIL_MAX_LENGTH,
+                play_beep=True, finish_on_key="#",
+                recording_status_callback="/voice/recording-ready", recording_status_callback_method="POST")
     resp.say("Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
     return Response(str(resp), mimetype="text/xml")
 
-
-@app.route("/voice/check-pin", methods=["POST"])
+@webhook_app.route("/voice/check-pin", methods=["POST"])
 def check_pin():
-    """Check if entered PIN matches."""
     digits = request.form.get("Digits", "")
     call_sid = request.form.get("CallSid", "unknown")
-    caller = request.form.get("From", "unknown")
+    caller = get_caller_info(request.form)
     print(f"🔑 PIN check: {digits} (expected {VOICEMAIL_PIN})")
 
     resp = VoiceResponse()
-
     if digits == VOICEMAIL_PIN:
         print(f"✅ PIN correct — connecting {caller} to AI")
         resp.say("Connecting you now.", voice=TTS_VOICE, language=TTS_LANGUAGE)
@@ -420,47 +568,28 @@ def check_pin():
         connect.stream(url=f"wss://{request.host}/ws/call")
         resp.append(connect)
     else:
-        # Wrong PIN → voicemail (no hint that a PIN exists)
         print(f"❌ Wrong PIN: {digits}")
-        resp.say(
-            "Please leave a message after the tone. Press hash when finished.",
-            voice=TTS_VOICE, language=TTS_LANGUAGE,
-        )
-        resp.record(
-            action="/voice/voicemail-complete",
-            method="POST",
-            max_length=VOICEMAIL_MAX_LENGTH,
-            play_beep=True,
-            finish_on_key="#",
-            recording_status_callback="/voice/recording-ready",
-            recording_status_callback_method="POST",
-        )
-
+        resp.say("Please leave a message after the tone. Press hash when finished.",
+                 voice=TTS_VOICE, language=TTS_LANGUAGE)
+        resp.record(action="/voice/voicemail-complete", method="POST", max_length=VOICEMAIL_MAX_LENGTH,
+                    play_beep=True, finish_on_key="#",
+                    recording_status_callback="/voice/recording-ready", recording_status_callback_method="POST")
     return Response(str(resp), mimetype="text/xml")
 
-
-@app.route("/voice/voicemail-complete", methods=["POST"])
+@webhook_app.route("/voice/voicemail-complete", methods=["POST"])
 def voicemail_complete():
-    """After voicemail recording is done."""
     call_sid = request.form.get("CallSid", "unknown")
     recording_url = request.form.get("RecordingUrl", "")
     recording_sid = request.form.get("RecordingSid", "")
     duration = request.form.get("RecordingDuration", "0")
-    caller = request.form.get("From", "unknown")
-
+    caller = get_caller_info(request.form)
     print(f"📩 Voicemail from {caller}: {duration}s, SID={recording_sid}")
 
-    # Store voicemail metadata
     voicemails = load_voicemails()
     voicemails.append({
-        "sid": recording_sid,
-        "from": caller,
-        "duration": int(duration),
-        "url": f"{recording_url}.wav",
-        "time": datetime.now().isoformat(),
-        "timestamp": time.time(),
-        "transcript": "",
-        "read": False,
+        "sid": recording_sid, "from": caller, "duration": int(duration),
+        "url": f"{recording_url}.wav", "time": datetime.now().isoformat(),
+        "timestamp": time.time(), "transcript": "", "read": False,
     })
     save_voicemails(voicemails)
 
@@ -469,53 +598,34 @@ def voicemail_complete():
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
 
-
-@app.route("/voice/recording-ready", methods=["POST"])
+@webhook_app.route("/voice/recording-ready", methods=["POST"])
 def recording_ready():
-    """Called when a voicemail recording is fully processed."""
     recording_sid = request.form.get("RecordingSid", "")
     recording_url = request.form.get("RecordingUrl", "")
-    caller = request.form.get("From", "unknown")
+    caller = get_caller_info(request.form)
     duration = request.form.get("RecordingDuration", "0")
     transcription_text = request.form.get("TranscriptionText", "")
-
     print(f"🎙️ Recording ready: {recording_sid}")
-
-    # Download and save locally
-    thread = threading.Thread(
-        target=_process_voicemail,
-        args=(recording_sid, recording_url, caller, duration, transcription_text),
-        daemon=True,
-    )
-    thread.start()
-
+    threading.Thread(target=_process_voicemail,
+                     args=(recording_sid, recording_url, caller, duration, transcription_text),
+                     daemon=True).start()
     return "", 204
 
-
 def _process_voicemail(recording_sid, recording_url, caller, duration, transcription_text):
-    """Download, transcribe, and store voicemail."""
     try:
-        # Download from Twilio
         audio_url = f"{recording_url}.wav"
         r = http_requests.get(audio_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=30)
         if r.status_code != 200:
-            print(f"❌ Download failed: {r.status_code}")
             return
-
-        # Save audio file
         audio_path = AUDIO_DIR / f"{recording_sid}.wav"
         audio_path.write_bytes(r.content)
 
-        # Transcribe with local STT first, then Deepgram fallback
         transcript = transcription_text
         if not transcript and voice_engine and voice_engine.stt:
             try:
                 transcript = voice_engine.transcribe(str(audio_path))
-                if transcript:
-                    print(f"📝 Local STT transcript: {transcript[:80]}...")
             except Exception as e:
                 print(f"⚠️ Local STT failed: {e}")
-
         if not transcript and dg_client:
             try:
                 payload = {"buffer": r.content}
@@ -526,7 +636,6 @@ def _process_voicemail(recording_sid, recording_url, caller, duration, transcrip
             except Exception as e:
                 print(f"⚠️ Deepgram transcription failed: {e}")
 
-        # Update metadata with transcript
         voicemails = load_voicemails()
         for vm in voicemails:
             if vm["sid"] == recording_sid:
@@ -534,76 +643,50 @@ def _process_voicemail(recording_sid, recording_url, caller, duration, transcrip
                 vm["audio_path"] = str(audio_path)
                 break
         save_voicemails(voicemails)
-
-        # Telegram notification
         notify_telegram(recording_url, caller, duration, transcript)
-
         print(f"✅ Voicemail saved: {audio_path}")
-
     except Exception as e:
         print(f"❌ Voicemail processing error: {e}")
 
-
-# ═══════════════════════════════════════════════════════════════════
-# Outgoing calls
-# ═══════════════════════════════════════════════════════════════════
-
-@app.route("/voice/outgoing", methods=["POST"])
+@webhook_app.route("/voice/outgoing", methods=["POST"])
 def handle_outgoing():
-    """Handle outgoing call — connect to AI."""
     call_sid = request.form.get("CallSid", "unknown")
     print(f"📱 Outgoing connected: {call_sid}")
-
     resp = VoiceResponse()
     connect = Connect()
     connect.stream(url=f"wss://{request.host}/ws/call")
     resp.append(connect)
     return Response(str(resp), mimetype="text/xml")
 
-
-@app.route("/voice/status", methods=["POST"])
+@webhook_app.route("/voice/status", methods=["POST"])
 def handle_status():
-    """Call status callback — logs transcript when call ends."""
     call_sid = request.form.get("CallSid", "")
     status = request.form.get("CallStatus", "")
     print(f"📊 {call_sid}: {status}")
-
     if status in ("completed", "failed", "busy", "no-answer"):
         state = call_states.pop(call_sid, None)
         if state and state.get("transcript"):
-            print(f"\n{'='*50}")
-            print(f"📝 TRANSCRIPT:")
+            print(f"\n{'='*50}\n📝 TRANSCRIPT:")
             for m in state["transcript"]:
                 tag = "🎤" if m["role"] == "user" else "🤖"
                 print(f"  {tag} {m['text']}")
             print(f"{'='*50}")
     return "", 204
 
-
-# ═══════════════════════════════════════════════════════════════════
-# WebSocket (Twilio Media Streams)
-# ═══════════════════════════════════════════════════════════════════
-
-@sock.route("/ws/call")
+@webhook_sock.route("/ws/call")
 def handle_ws(ws):
     """Bi-directional audio: Twilio ↔ Deepgram STT ↔ LLM ↔ TTS."""
     print("🔌 WebSocket connected")
-
     stream_sid = None
     call_sid = None
 
-    # Set up Deepgram live transcription
     dg_conn = None
     if dg_client:
         try:
             from deepgram.core.events import EventType
             dg_conn = dg_client.listen.v1.connect(
-                model="nova-2-phonecall",
-                encoding="linear16",
-                sample_rate=8000,
-                channels=1,
-                punctuate=True,
-                interim_results=True,
+                model="nova-2-phonecall", encoding="linear16",
+                sample_rate=8000, channels=1, punctuate=True, interim_results=True,
             )
             print("✅ Deepgram connected")
         except Exception as e:
@@ -614,17 +697,14 @@ def handle_ws(ws):
 
     if dg_conn:
         from deepgram.core.events import EventType
-
         def on_message(msg):
             nonlocal speech_final
             if hasattr(msg, "channel") and msg.channel:
                 text = msg.channel.alternatives[0].transcript
                 if text.strip():
                     transcript_buf.append(text)
-                    print(f"🎤 {text}")
                     if getattr(msg, "is_final", False):
                         speech_final = True
-
         dg_conn.on(EventType.MESSAGE, on_message)
 
     try:
@@ -632,37 +712,28 @@ def handle_ws(ws):
             data = ws.receive(timeout=30)
             if data is None:
                 break
-
             msg = json.loads(data)
-
             if msg["event"] == "start":
                 stream_sid = msg["start"]["streamSid"]
                 call_sid = msg["start"]["callSid"]
-                print(f"🎙️ Stream: {stream_sid}")
-
             elif msg["event"] == "media":
                 audio = base64.b64decode(msg["media"]["payload"])
                 if dg_conn:
                     dg_conn.send_media(audio)
-
             elif msg["event"] == "stop":
                 break
 
-            # Check for complete utterance
             if speech_final and stream_sid:
                 full_text = " ".join(transcript_buf).strip()
                 transcript_buf.clear()
                 speech_final = False
-
                 if full_text and len(full_text) > 2:
                     print(f"💬 User: {full_text}")
                     reply = get_llm_response(call_sid or "ws", full_text)
                     print(f"🤖 AI: {reply}")
-
                     audio = synthesize_speech(reply)
                     if audio:
                         send_audio_to_ws(ws, stream_sid, audio)
-
     except Exception as e:
         print(f"❌ WS error: {e}")
     finally:
@@ -670,34 +741,76 @@ def handle_ws(ws):
             dg_conn.close()
         print("🔌 WebSocket closed")
 
+@webhook_app.route("/health", methods=["GET"])
+@dashboard_app.route("/health", methods=["GET"])
+def health():
+    hermes_ok = False
+    hermes_model = None
+    if HERMES_GATEWAY_URL:
+        try:
+            r = http_requests.get(f"{HERMES_GATEWAY_URL}/v1/models", headers=get_auth_headers(), timeout=3)
+            hermes_ok = r.status_code == 200
+            if hermes_ok:
+                models = r.json().get("data", [])
+                if models:
+                    hermes_model = models[0].get("id", "unknown")
+        except:
+            pass
+
+    return jsonify({
+        "status": "ok",
+        "twilio": bool(TWILIO_SID),
+        "deepgram": bool(DEEPGRAM_KEY),
+        "hermes_gateway": hermes_ok,
+        "hermes_model": hermes_model,
+        "llm_legacy": LLM_PROVIDER if not hermes_ok else None,
+        "voicemails": len(load_voicemails()),
+        "webhook_port": WEBHOOK_PORT,
+        "dashboard_port": DASHBOARD_PORT,
+    })
 
 # ═══════════════════════════════════════════════════════════════════
-# API Endpoints
+# DASHBOARD APP (port 5051 — auth protected)
 # ═══════════════════════════════════════════════════════════════════
 
-@app.route("/call", methods=["POST"])
+@dashboard_app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        data = request.json or {}
+        token = data.get("token", "")
+        if check_auth(token):
+            resp = jsonify({"status": "ok"})
+            resp.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="Lax", max_age=86400 * 30)
+            return resp
+        return jsonify({"status": "error"}), 401
+    return Response(LOGIN_HTML, mimetype="text/html")
+
+@dashboard_app.route("/logout", methods=["GET"])
+def logout():
+    resp = Response('<script>window.location="/login";</script>', mimetype="text/html")
+    resp.delete_cookie(AUTH_COOKIE)
+    return resp
+
+@dashboard_app.route("/call", methods=["POST"])
 def make_call():
-    """Make an outbound call."""
     global CALL_GOAL
     data = request.json or {}
     to_number = data.get("to", "")
     goal = data.get("goal", CALL_GOAL)
-
     if not to_number:
         return jsonify({"error": "Missing 'to'"}), 400
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
         return jsonify({"error": "Twilio not configured"}), 500
 
+    webhook_base = WEBHOOK_URL_OVERRIDE or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
     old_goal = CALL_GOAL
     CALL_GOAL = goal
-
     try:
         client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
-            to=to_number,
-            from_=TWILIO_FROM,
-            url=f"https://{request.host}/voice/outgoing",
-            status_callback=f"https://{request.host}/voice/status",
+            to=to_number, from_=TWILIO_FROM,
+            url=f"{webhook_base}/voice/outgoing",
+            status_callback=f"{webhook_base}/voice/status",
             status_callback_event=["completed", "failed", "busy", "no-answer"],
             timeout=30,
         )
@@ -707,52 +820,105 @@ def make_call():
         CALL_GOAL = old_goal
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/voicemails", methods=["GET"])
+@dashboard_app.route("/voicemails", methods=["GET"])
 def list_voicemails():
-    """List all voicemails."""
     return jsonify(load_voicemails())
 
-
-@app.route("/voicemails/<sid>", methods=["DELETE"])
+@dashboard_app.route("/voicemails/<sid>", methods=["DELETE"])
 def delete_voicemail(sid):
-    """Delete a voicemail."""
     voicemails = load_voicemails()
     voicemails = [vm for vm in voicemails if vm["sid"] != sid]
     save_voicemails(voicemails)
-
-    # Delete audio file
     audio_path = AUDIO_DIR / f"{sid}.wav"
     if audio_path.exists():
         audio_path.unlink()
-
     return jsonify({"status": "deleted", "sid": sid})
 
-
-@app.route("/health", methods=["GET"])
-def health():
-    """Server health check."""
-    return jsonify({
-        "status": "ok",
-        "twilio": bool(TWILIO_SID),
-        "deepgram": bool(DEEPGRAM_KEY),
-        "llm": bool(llm_client),
-        "provider": LLM_PROVIDER,
-        "model": LLM_MODEL,
-        "voicemails": len(load_voicemails()),
-    })
-
+@dashboard_app.route("/voicemails/<sid>/audio", methods=["GET"])
+def serve_voicemail_audio(sid):
+    audio_path = AUDIO_DIR / f"{sid}.wav"
+    if audio_path.exists():
+        return Response(audio_path.read_bytes(), mimetype="audio/wav")
+    return jsonify({"error": "Audio not found"}), 404
 
 # ═══════════════════════════════════════════════════════════════════
 # Settings API
 # ═══════════════════════════════════════════════════════════════════
 
-def get_settings():
-    """Read current settings from .env."""
+# All configurable settings with metadata
+# STT/TTS provider options for dropdown
+STT_PROVIDERS = [
+    {"id": "deepgram", "name": "Deepgram Nova-3", "type": "cloud", "cost": "$0.29/hr"},
+    {"id": "assemblyai", "name": "AssemblyAI Universal-3", "type": "cloud", "cost": "$0.21/hr"},
+    {"id": "google", "name": "Google Cloud STT", "type": "cloud", "cost": "$0.96/hr"},
+    {"id": "azure", "name": "Azure Speech", "type": "cloud", "cost": "$1.00/hr"},
+    {"id": "groq", "name": "Groq Whisper", "type": "cloud", "cost": "$0.04/hr"},
+    {"id": "speechmatics", "name": "Speechmatics", "type": "cloud", "cost": "$0.24/hr"},
+    {"id": "whisper", "name": "OpenAI Whisper", "type": "cloud", "cost": "$0.06/hr"},
+    {"id": "local", "name": "Local (mlx-whisper)", "type": "local", "cost": "Free"},
+    {"id": "faster-whisper", "name": "faster-whisper", "type": "local", "cost": "Free"},
+]
+
+TTS_PROVIDERS = [
+    {"id": "polly", "name": "AWS Polly", "type": "cloud", "cost": "$16/1M chars"},
+    {"id": "elevenlabs", "name": "ElevenLabs", "type": "cloud", "cost": "~$0.30/min"},
+    {"id": "openai", "name": "OpenAI TTS", "type": "cloud", "cost": "$15/1M chars"},
+    {"id": "azure", "name": "Azure Speech", "type": "cloud", "cost": "$15/1M chars"},
+    {"id": "google", "name": "Google Cloud TTS", "type": "cloud", "cost": "$16/1M chars"},
+    {"id": "cartesia", "name": "Cartesia Sonic", "type": "cloud", "cost": "~$0.003/credit"},
+    {"id": "deepgram_aura", "name": "Deepgram Aura", "type": "cloud", "cost": "$0.03/1K chars"},
+    {"id": "kokoro", "name": "Kokoro (local)", "type": "local", "cost": "Free"},
+    {"id": "edge", "name": "Edge TTS", "type": "cloud", "cost": "Free"},
+    {"id": "mimo", "name": "MiMo TTS", "type": "cloud", "cost": "Free"},
+]
+
+SETTINGS_SCHEMA = {
+    "COMPANY_NAME": {"label": "Company Name", "type": "text", "section": "company"},
+    "VOICEMAIL_EMAIL": {"label": "Voicemail Email", "type": "email", "section": "company"},
+    "VOICEMAIL_GREETING": {"label": "Voicemail Greeting", "type": "textarea", "section": "company"},
+    "VOICEMAIL_PIN": {"label": "Voicemail PIN", "type": "text", "section": "company"},
+    "VOICEMAIL_MAX_LENGTH": {"label": "Max Recording (seconds)", "type": "number", "section": "company"},
+    "TTS_VOICE": {"label": "TTS Voice", "type": "select", "section": "voice"},
+    "TTS_LANGUAGE": {"label": "Language", "type": "select", "section": "voice"},
+    "USE_LOCAL_VOICE": {"label": "Voice Engine", "type": "select", "section": "voice"},
+    # STT providers
+    "STT_PROVIDER": {"label": "STT Provider", "type": "select", "section": "stt"},
+    "DEEPGRAM_API_KEY": {"label": "Deepgram API Key", "type": "password", "section": "stt", "sensitive": True},
+    "ASSEMBLYAI_API_KEY": {"label": "AssemblyAI API Key", "type": "password", "section": "stt", "sensitive": True},
+    "GROQ_API_KEY": {"label": "Groq API Key", "type": "password", "section": "stt", "sensitive": True},
+    "SPEECHMATICS_API_KEY": {"label": "Speechmatics API Key", "type": "password", "section": "stt", "sensitive": True},
+    # TTS providers
+    "TTS_PROVIDER": {"label": "TTS Provider", "type": "select", "section": "tts"},
+    "ELEVENLABS_API_KEY": {"label": "ElevenLabs API Key", "type": "password", "section": "tts", "sensitive": True},
+    "ELEVENLABS_VOICE_ID": {"label": "ElevenLabs Voice ID", "type": "text", "section": "tts"},
+    "CARTESIA_API_KEY": {"label": "Cartesia API Key", "type": "password", "section": "tts", "sensitive": True},
+    "CARTESIA_VOICE_ID": {"label": "Cartesia Voice ID", "type": "text", "section": "tts"},
+    "CALL_GOAL": {"label": "Call Goal", "type": "text", "section": "ai"},
+    "CALL_SYSTEM_PROMPT": {"label": "System Prompt", "type": "textarea", "section": "ai"},
+    # API keys (sensitive)
+    "TWILIO_ACCOUNT_SID": {"label": "Twilio Account SID", "type": "text", "section": "twilio", "sensitive": True},
+    "TWILIO_AUTH_TOKEN": {"label": "Twilio Auth Token", "type": "password", "section": "twilio", "sensitive": True},
+    "TWILIO_PHONE_NUMBER": {"label": "Twilio Phone Number", "type": "tel", "section": "twilio"},
+    "DEEPGRAM_API_KEY": {"label": "Deepgram API Key", "type": "password", "section": "deepgram", "sensitive": True},
+    "XIAOMI_API_KEY": {"label": "Xiaomi API Key", "type": "password", "section": "llm", "sensitive": True},
+    "XIAOMI_BASE_URL": {"label": "Xiaomi Base URL", "type": "text", "section": "llm"},
+    "OPENAI_API_KEY": {"label": "OpenAI API Key", "type": "password", "section": "llm", "sensitive": True},
+    "OPENAI_BASE_URL": {"label": "OpenAI Base URL", "type": "text", "section": "llm"},
+    "OPENROUTER_API_KEY": {"label": "OpenRouter API Key", "type": "password", "section": "llm", "sensitive": True},
+    "HERMES_GATEWAY_URL": {"label": "Hermes Gateway URL", "type": "text", "section": "hermes"},
+    "HERMES_GATEWAY_TOKEN": {"label": "Hermes Gateway Token", "type": "password", "section": "hermes", "sensitive": True},
+    "LLM_PROVIDER": {"label": "LLM Provider", "type": "select", "section": "llm"},
+    "LLM_MODEL": {"label": "LLM Model", "type": "text", "section": "llm"},
+    "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network"},
+    "TELEGRAM_BOT_TOKEN": {"label": "Telegram Bot Token", "type": "password", "section": "telegram", "sensitive": True},
+    "TELEGRAM_CHAT_ID": {"label": "Telegram Chat ID", "type": "text", "section": "telegram"},
+}
+
+def get_all_settings():
+    """Read all settings from .env."""
     settings = {}
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        with open(env_path) as f:
+    if ENV_FILE.exists():
+        with open(ENV_FILE) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -760,15 +926,12 @@ def get_settings():
                     settings[k.strip()] = v.strip().strip('"').strip("'")
     return settings
 
-
 def update_setting(key, value):
     """Update a single setting in .env."""
-    env_path = Path(__file__).parent / ".env"
     lines = []
     found = False
-
-    if env_path.exists():
-        with open(env_path) as f:
+    if ENV_FILE.exists():
+        with open(ENV_FILE) as f:
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith(f"{key}="):
@@ -776,42 +939,42 @@ def update_setting(key, value):
                     found = True
                 else:
                     lines.append(line)
-
     if not found:
-        lines.append(f'{key}="{value}"\n')
-
-    with open(env_path, "w") as f:
+        lines.append(f'\n{key}="{value}"\n')
+    with open(ENV_FILE, "w") as f:
         f.writelines(lines)
-
-    # Update in-memory
     os.environ[key] = value
 
+def mask_value(key, value):
+    """Mask sensitive values."""
+    schema = SETTINGS_SCHEMA.get(key, {})
+    if not schema.get("sensitive"):
+        return value
+    if len(value) > 8:
+        return value[:4] + "..." + value[-4:]
+    if value:
+        return "***"
+    return ""
 
-@app.route("/api/settings", methods=["GET"])
+@dashboard_app.route("/api/settings", methods=["GET"])
 def api_get_settings():
-    """Get current settings."""
-    settings = get_settings()
-    # Mask sensitive values
-    masked = {}
-    for k, v in settings.items():
-        if any(s in k.upper() for s in ["TOKEN", "KEY", "SECRET", "AUTH"]):
-            if len(v) > 8:
-                masked[k] = v[:4] + "..." + v[-4:]
-            else:
-                masked[k] = "***"
-        else:
-            masked[k] = v
+    settings = get_all_settings()
+    result = {}
+    for key, schema in SETTINGS_SCHEMA.items():
+        val = settings.get(key, "")
+        result[key] = mask_value(key, val) if schema.get("sensitive") else val
 
-    # Add computed info
-    masked["_status"] = {
+    # Service status
+    result["_status"] = {
         "twilio": bool(TWILIO_SID),
         "deepgram": bool(DEEPGRAM_KEY),
-        "llm": bool(llm_client),
+        "hermes_gateway": bool(HERMES_GATEWAY_URL),
         "voice_engine": voice_engine.mode if voice_engine else "none",
     }
-
-    # Available TTS voices (Twilio Polly voices)
-    masked["_available_voices"] = [
+    result["_schema"] = SETTINGS_SCHEMA
+    result["_stt_providers"] = STT_PROVIDERS
+    result["_tts_providers"] = TTS_PROVIDERS
+    result["_available_voices"] = [
         {"id": "Polly.Amy", "name": "Amy", "lang": "en-GB", "gender": "Female"},
         {"id": "Polly.Brian", "name": "Brian", "lang": "en-GB", "gender": "Male"},
         {"id": "Polly.Emma", "name": "Emma", "lang": "en-GB", "gender": "Female"},
@@ -825,405 +988,74 @@ def api_get_settings():
         {"id": "Polly.Nicole", "name": "Nicole", "lang": "en-AU", "gender": "Female"},
         {"id": "Polly.Russell", "name": "Russell", "lang": "en-AU", "gender": "Male"},
     ]
+    return jsonify(result)
 
-    return jsonify(masked)
-
-
-@app.route("/api/settings", methods=["POST"])
+@dashboard_app.route("/api/settings", methods=["POST"])
 def api_update_settings():
-    """Update settings."""
     data = request.json or {}
-    allowed = [
-        "COMPANY_NAME", "VOICEMAIL_EMAIL", "VOICEMAIL_PIN",
-        "VOICEMAIL_GREETING", "VOICEMAIL_MAX_LENGTH",
-        "TTS_VOICE", "TTS_LANGUAGE", "USE_LOCAL_VOICE",
-        "CALL_GOAL", "CALL_SYSTEM_PROMPT",
-    ]
-
     updated = []
+    deleted = []
     for key, value in data.items():
-        if key in allowed:
-            update_setting(key, str(value))
-            updated.append(key)
+        if key in SETTINGS_SCHEMA:
+            if value == "" and SETTINGS_SCHEMA[key].get("sensitive"):
+                # Empty value for sensitive field = clear it
+                update_setting(key, "")
+                deleted.append(key)
+            else:
+                update_setting(key, str(value))
+                updated.append(key)
+    return jsonify({"status": "ok", "updated": updated, "deleted": deleted})
 
-    return jsonify({"status": "ok", "updated": updated})
+@dashboard_app.route("/api/models", methods=["GET"])
+def list_models():
+    """List available models from Hermes Gateway, Ollama, and LM Studio."""
+    models = {"hermes": [], "ollama": [], "lmstudio": []}
 
+    # Hermes Gateway
+    if HERMES_GATEWAY_URL:
+        try:
+            r = http_requests.get(f"{HERMES_GATEWAY_URL}/v1/models", headers=get_auth_headers(), timeout=5)
+            if r.status_code == 200:
+                models["hermes"] = [m.get("id", "") for m in r.json().get("data", [])]
+        except:
+            pass
+
+    # Ollama
+    try:
+        r = http_requests.get("http://localhost:11434/api/tags", timeout=3)
+        if r.status_code == 200:
+            models["ollama"] = [m["name"] for m in r.json().get("models", [])]
+    except:
+        pass
+
+    # LM Studio
+    try:
+        r = http_requests.get("http://localhost:1234/v1/models", timeout=3)
+        if r.status_code == 200:
+            models["lmstudio"] = [m["id"] for m in r.json().get("data", [])]
+    except:
+        pass
+
+    return jsonify(models)
 
 # ═══════════════════════════════════════════════════════════════════
-# Web Dashboard
+# Export endpoints
 # ═══════════════════════════════════════════════════════════════════
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📞 Hermes Phone</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; }
-        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 24px 32px; border-bottom: 1px solid #333; }
-        .header h1 { font-size: 24px; font-weight: 600; }
-        .header .subtitle { color: #888; font-size: 14px; margin-top: 4px; }
-        .nav { display: flex; gap: 0; padding: 0 32px; background: #111; border-bottom: 1px solid #222; }
-        .nav a { padding: 12px 20px; color: #888; text-decoration: none; font-size: 14px; border-bottom: 2px solid transparent; transition: all 0.15s; }
-        .nav a:hover { color: #e0e0e0; }
-        .nav a.active { color: #fff; border-bottom-color: #3b82f6; }
-        .status-bar { display: flex; gap: 16px; padding: 16px 32px; background: #111; border-bottom: 1px solid #222; }
-        .status-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-        .dot { width: 8px; height: 8px; border-radius: 50%; }
-        .dot.green { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
-        .dot.red { background: #f87171; }
-        .container { max-width: 960px; margin: 0 auto; padding: 32px; }
-        .section { margin-bottom: 32px; }
-        .section h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #fff; }
-        .card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; overflow: hidden; }
-        .voicemail-item { padding: 16px 20px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 16px; transition: background 0.15s; }
-        .voicemail-item:hover { background: #222; }
-        .voicemail-item:last-child { border-bottom: none; }
-        .vm-icon { font-size: 24px; }
-        .vm-info { flex: 1; }
-        .vm-caller { font-weight: 600; font-size: 15px; }
-        .vm-time { color: #888; font-size: 12px; margin-top: 2px; }
-        .vm-transcript { color: #aaa; font-size: 13px; margin-top: 6px; line-height: 1.4; }
-        .vm-actions { display: flex; gap: 8px; }
-        .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid #444; background: #222; color: #e0e0e0; font-size: 12px; cursor: pointer; transition: all 0.15s; }
-        .btn:hover { background: #333; border-color: #666; }
-        .btn.danger { border-color: #991b1b; color: #f87171; }
-        .btn.danger:hover { background: #991b1b; color: #fff; }
-        .btn.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
-        .btn.primary:hover { background: #2563eb; }
-        .empty { padding: 48px; text-align: center; color: #666; }
-        .export-bar { display: flex; gap: 8px; margin-bottom: 16px; }
-        .call-form { display: flex; gap: 8px; margin-bottom: 16px; }
-        .call-form input { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #e0e0e0; font-size: 14px; }
-        audio { width: 200px; height: 32px; }
-        /* Settings */
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; font-weight: 500; }
-        .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: #e0e0e0; font-size: 14px; font-family: inherit; }
-        .form-group textarea { min-height: 80px; resize: vertical; }
-        .form-group select { cursor: pointer; }
-        .form-group .hint { font-size: 11px; color: #666; margin-top: 4px; }
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        .save-bar { position: sticky; bottom: 0; padding: 16px 0; background: linear-gradient(transparent, #0a0a0a 20%); display: flex; justify-content: flex-end; gap: 8px; }
-        .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 100; animation: fadeIn 0.2s; }
-        .toast.success { background: #065f46; color: #6ee7b7; border: 1px solid #059669; }
-        .toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
-        .badge.green { background: #065f46; color: #6ee7b7; }
-        .badge.red { background: #7f1d1d; color: #fca5a5; }
-        .badge.yellow { background: #78350f; color: #fcd34d; }
-        .page { display: none; }
-        .page.active { display: block; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📞 Hermes Phone</h1>
-        <div class="subtitle">AI-powered phone agent</div>
-    </div>
-    <div class="nav">
-        <a href="#" class="active" onclick="showPage('dashboard')">Dashboard</a>
-        <a href="#" onclick="showPage('settings')">Settings</a>
-    </div>
-    <div class="status-bar" id="status-bar">
-        <div class="status-item"><div class="dot" id="status-dot"></div><span id="status-text">Loading...</span></div>
-    </div>
-
-    <!-- Dashboard Page -->
-    <div class="container page active" id="page-dashboard">
-        <div class="section">
-            <h2>Make a Call</h2>
-            <div class="call-form">
-                <input type="tel" id="call-number" placeholder="+447...">
-                <button class="btn primary" onclick="makeCall()">📞 Call</button>
-            </div>
-        </div>
-        <div class="section">
-            <h2>Voicemails</h2>
-            <div class="export-bar">
-                <button class="btn" onclick="exportAll()">📦 Export All (ZIP)</button>
-                <button class="btn" onclick="exportTranscripts()">📝 Export Transcripts</button>
-            </div>
-            <div class="card" id="voicemail-list">
-                <div class="empty">Loading voicemails...</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Settings Page -->
-    <div class="container page" id="page-settings">
-        <div class="section">
-            <h2>Company & Voicemail</h2>
-            <div class="card" style="padding: 24px;">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Company Name</label>
-                        <input type="text" id="set-COMPANY_NAME" placeholder="My Company">
-                    </div>
-                    <div class="form-group">
-                        <label>Voicemail Email</label>
-                        <input type="email" id="set-VOICEMAIL_EMAIL" placeholder="hello@company.com">
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Voicemail Greeting</label>
-                    <textarea id="set-VOICEMAIL_GREETING" placeholder="Leave empty for default: 'Thank you for calling [company]. Please leave a message after the tone.'"></textarea>
-                    <div class="hint">Custom greeting played to callers. Leave empty for the default.</div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Voicemail PIN</label>
-                        <input type="text" id="set-VOICEMAIL_PIN" placeholder="1234">
-                        <div class="hint">Callers dial this during greeting to reach AI</div>
-                    </div>
-                    <div class="form-group">
-                        <label>Max Recording (seconds)</label>
-                        <input type="number" id="set-VOICEMAIL_MAX_LENGTH" placeholder="120">
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>Voice</h2>
-            <div class="card" style="padding: 24px;">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>TTS Voice</label>
-                        <select id="set-TTS_VOICE">
-                            <option value="">Loading voices...</option>
-                        </select>
-                        <div class="hint">Voice used for system messages (greeting, goodbye)</div>
-                    </div>
-                    <div class="form-group">
-                        <label>Language</label>
-                        <select id="set-TTS_LANGUAGE">
-                            <option value="en-GB">English (UK)</option>
-                            <option value="en-US">English (US)</option>
-                            <option value="en-AU">English (AU)</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Voice Engine</label>
-                    <select id="set-USE_LOCAL_VOICE">
-                        <option value="auto">Auto (local if available, else cloud)</option>
-                        <option value="true">Local Only (MLX on Apple Silicon)</option>
-                        <option value="false">Cloud Only (Deepgram/Edge TTS)</option>
-                    </select>
-                    <div class="hint">Local mode uses mlx-whisper + mlx-audio (zero API costs)</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>AI Agent</h2>
-            <div class="card" style="padding: 24px;">
-                <div class="form-group">
-                    <label>Call Goal</label>
-                    <input type="text" id="set-CALL_GOAL" placeholder="Have a helpful conversation.">
-                    <div class="hint">What the AI should try to achieve during calls</div>
-                </div>
-                <div class="form-group">
-                    <label>System Prompt</label>
-                    <textarea id="set-CALL_SYSTEM_PROMPT" placeholder="Leave empty for default behavior"></textarea>
-                    <div class="hint">Custom instructions for the AI during calls</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>Service Status</h2>
-            <div class="card" style="padding: 24px;">
-                <div id="service-status">Loading...</div>
-            </div>
-        </div>
-
-        <div class="save-bar">
-            <button class="btn" onclick="loadSettings()">Reset</button>
-            <button class="btn primary" onclick="saveSettings()">💾 Save Settings</button>
-        </div>
-    </div>
-
-    <script>
-        // Navigation
-        function showPage(name) {
-            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-            document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
-            document.getElementById('page-' + name).classList.add('active');
-            event.target.classList.add('active');
-            if (name === 'settings') loadSettings();
-        }
-
-        function toast(msg, type='success') {
-            const el = document.createElement('div');
-            el.className = 'toast ' + type;
-            el.textContent = msg;
-            document.body.appendChild(el);
-            setTimeout(() => el.remove(), 3000);
-        }
-
-        // Status
-        async function loadStatus() {
-            try {
-                const r = await fetch('/health');
-                const d = await r.json();
-                document.getElementById('status-dot').className = 'dot ' + (d.status === 'ok' ? 'green' : 'red');
-                document.getElementById('status-text').textContent = d.status === 'ok'
-                    ? `Running — ${d.provider}/${d.model} — ${d.voicemails} voicemails`
-                    : 'Offline';
-            } catch { document.getElementById('status-dot').className = 'dot red'; document.getElementById('status-text').textContent = 'Offline'; }
-        }
-
-        // Voicemails
-        async function loadVoicemails() {
-            try {
-                const r = await fetch('/voicemails');
-                const vms = await r.json();
-                const el = document.getElementById('voicemail-list');
-                if (!vms.length) { el.innerHTML = '<div class="empty">No voicemails yet</div>'; return; }
-                el.innerHTML = vms.reverse().map(vm => `
-                    <div class="voicemail-item">
-                        <div class="vm-icon">📞</div>
-                        <div class="vm-info">
-                            <div class="vm-caller">${(vm.from||'Unknown').replace('+','')}</div>
-                            <div class="vm-time">${vm.duration}s — ${new Date(vm.time).toLocaleString()}</div>
-                            ${vm.transcript ? `<div class="vm-transcript">"${vm.transcript}"</div>` : '<div class="vm-transcript" style="color:#666">(no transcript)</div>'}
-                        </div>
-                        <div class="vm-actions">
-                            ${vm.audio_path ? `<audio controls src="/voicemails/${vm.sid}/audio"></audio>` : ''}
-                            <button class="btn danger" onclick="deleteVM('${vm.sid}')">🗑️</button>
-                        </div>
-                    </div>
-                `).join('');
-            } catch(e) { console.error(e); }
-        }
-
-        async function deleteVM(sid) {
-            if (!confirm('Delete this voicemail?')) return;
-            await fetch('/voicemails/' + sid, {method:'DELETE'});
-            loadVoicemails(); loadStatus();
-        }
-
-        async function makeCall() {
-            const num = document.getElementById('call-number').value;
-            if (!num) return alert('Enter a phone number');
-            const r = await fetch('/call', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({to:num})});
-            const d = await r.json();
-            toast(d.sid ? 'Calling ' + num + '...' : 'Error: ' + d.error, d.sid ? 'success' : 'error');
-        }
-
-        function exportAll() { window.location = '/export/zip'; }
-        function exportTranscripts() { window.location = '/export/transcripts'; }
-
-        // Settings
-        let currentSettings = {};
-        let availableVoices = [];
-
-        async function loadSettings() {
-            try {
-                const r = await fetch('/api/settings');
-                const data = await r.json();
-                currentSettings = data;
-                availableVoices = data._available_voices || [];
-
-                // Populate voice dropdown
-                const voiceSelect = document.getElementById('set-TTS_VOICE');
-                voiceSelect.innerHTML = availableVoices.map(v =>
-                    `<option value="${v.id}" ${v.id === data.TTS_VOICE ? 'selected' : ''}>${v.name} (${v.lang}, ${v.gender})</option>`
-                ).join('');
-
-                // Populate form fields
-                const fields = ['COMPANY_NAME', 'VOICEMAIL_EMAIL', 'VOICEMAIL_GREETING', 'VOICEMAIL_PIN',
-                    'VOICEMAIL_MAX_LENGTH', 'TTS_LANGUAGE', 'USE_LOCAL_VOICE', 'CALL_GOAL', 'CALL_SYSTEM_PROMPT'];
-                fields.forEach(f => {
-                    const el = document.getElementById('set-' + f);
-                    if (el && data[f] !== undefined) el.value = data[f];
-                });
-
-                // Service status
-                const st = data._status || {};
-                document.getElementById('service-status').innerHTML = `
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-                        <div>Twilio: <span class="badge ${st.twilio?'green':'red'}">${st.twilio?'Connected':'Not configured'}</span></div>
-                        <div>Deepgram: <span class="badge ${st.deepgram?'green':'red'}">${st.deepgram?'Connected':'Not configured'}</span></div>
-                        <div>LLM: <span class="badge ${st.llm?'green':'red'}">${st.llm?'Connected':'Not configured'}</span></div>
-                        <div>Voice Engine: <span class="badge ${st.voice_engine.includes('local')?'green':'yellow'}">${st.voice_engine}</span></div>
-                    </div>
-                `;
-            } catch(e) { console.error(e); }
-        }
-
-        async function saveSettings() {
-            const fields = ['COMPANY_NAME', 'VOICEMAIL_EMAIL', 'VOICEMAIL_GREETING', 'VOICEMAIL_PIN',
-                'VOICEMAIL_MAX_LENGTH', 'TTS_VOICE', 'TTS_LANGUAGE', 'USE_LOCAL_VOICE', 'CALL_GOAL', 'CALL_SYSTEM_PROMPT'];
-            const data = {};
-            fields.forEach(f => {
-                const el = document.getElementById('set-' + f);
-                if (el) data[f] = el.value;
-            });
-
-            try {
-                const r = await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(data)
-                });
-                const result = await r.json();
-                toast('Settings saved! Restart server to apply some changes.', 'success');
-            } catch(e) {
-                toast('Failed to save settings', 'error');
-            }
-        }
-
-        loadStatus(); loadVoicemails();
-        setInterval(() => { loadStatus(); loadVoicemails(); }, 15000);
-    </script>
-</body>
-</html>"""
-
-
-@app.route("/", methods=["GET"])
-def dashboard():
-    """Web dashboard."""
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
-
-@app.route("/voicemails/<sid>/audio", methods=["GET"])
-def serve_voicemail_audio(sid):
-    """Serve voicemail audio file."""
-    audio_path = AUDIO_DIR / f"{sid}.wav"
-    if audio_path.exists():
-        return Response(audio_path.read_bytes(), mimetype="audio/wav")
-    return jsonify({"error": "Audio not found"}), 404
-
-
-@app.route("/export/zip", methods=["GET"])
+@dashboard_app.route("/export/zip", methods=["GET"])
 def export_zip():
-    """Export all voicemails as a ZIP file."""
-    import zipfile
-    import io
-
+    import zipfile, io
     voicemails = load_voicemails()
     if not voicemails:
         return jsonify({"error": "No voicemails to export"}), 404
-
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Add metadata
         zf.writestr("voicemails.json", json.dumps(voicemails, indent=2))
-
-        # Add audio files
         for vm in voicemails:
             audio_path = AUDIO_DIR / f"{vm['sid']}.wav"
             if audio_path.exists():
                 caller = vm.get("from", "unknown").replace("+", "")
                 zf.writestr(f"audio/{caller}_{vm['sid']}.wav", audio_path.read_bytes())
-
-        # Add transcript summary
         lines = ["Voicemail Transcripts", "=" * 50, ""]
         for vm in voicemails:
             caller = vm.get("from", "unknown").replace("+", "")
@@ -1233,18 +1065,12 @@ def export_zip():
             lines.append(f"Transcript: {vm.get('transcript', '(none)')}")
             lines.append("-" * 50)
         zf.writestr("transcripts.txt", "\n".join(lines))
-
     buffer.seek(0)
-    return Response(
-        buffer.getvalue(),
-        mimetype="application/zip",
-        headers={"Content-Disposition": "attachment; filename=hermes-phone-voicemails.zip"},
-    )
+    return Response(buffer.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=hermes-phone-voicemails.zip"})
 
-
-@app.route("/export/transcripts", methods=["GET"])
+@dashboard_app.route("/export/transcripts", methods=["GET"])
 def export_transcripts():
-    """Export transcripts as a text file."""
     voicemails = load_voicemails()
     lines = [f"Hermes Phone — Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
     for vm in voicemails:
@@ -1254,26 +1080,43 @@ def export_transcripts():
         lines.append(f"Time: {vm.get('time', 'unknown')}")
         lines.append(f"Transcript: {vm.get('transcript', '(none)')}")
         lines.append("-" * 50)
-
-    return Response(
-        "\n".join(lines),
-        mimetype="text/plain",
-        headers={"Content-Disposition": "attachment; filename=hermes-phone-transcripts.txt"},
-    )
-
+    return Response("\n".join(lines), mimetype="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=hermes-phone-transcripts.txt"})
 
 # ═══════════════════════════════════════════════════════════════════
-# Main
+# Dashboard HTML (served from port 5051)
 # ═══════════════════════════════════════════════════════════════════
+
+DASHBOARD_HTML = open(Path(__file__).parent / "dashboard.html").read() if (Path(__file__).parent / "dashboard.html").exists() else ""
+
+@dashboard_app.route("/", methods=["GET"])
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+# ═══════════════════════════════════════════════════════════════════
+# Main — run both servers
+# ═══════════════════════════════════════════════════════════════════
+
+def run_dashboard():
+    from werkzeug.serving import run_simple
+    print(f"  Dashboard: http://localhost:{DASHBOARD_PORT}")
+    run_simple("0.0.0.0", DASHBOARD_PORT, dashboard_app, use_reloader=False, threaded=True)
 
 if __name__ == "__main__":
+    init_voice_engine()
+
     print(f"📞 Hermes Phone Agent")
     print(f"   Company: {COMPANY_NAME}")
-    print(f"   LLM: {LLM_PROVIDER}/{LLM_MODEL}")
+    print(f"   Hermes Gateway: {HERMES_GATEWAY_URL or '❌ not configured'}")
+    print(f"   Legacy LLM: {LLM_PROVIDER}/{LLM_MODEL}" if not HERMES_GATEWAY_URL else f"   Legacy LLM: fallback")
     print(f"   STT: {'Deepgram' if dg_client else '❌'}")
     print(f"   Twilio: {'✅' if TWILIO_SID else '❌'}")
-    print(f"   LLM: {'✅' if llm_client else '❌'}")
     print(f"   PIN: {VOICEMAIL_PIN}")
     print(f"   Voicemails: {DATA_DIR}")
-    print(f"   Listening on 0.0.0.0:5050")
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    print(f"   Webhook: http://0.0.0.0:{WEBHOOK_PORT}")
+
+    # Start dashboard in background thread
+    threading.Thread(target=run_dashboard, daemon=True).start()
+
+    # Run webhook server (main thread)
+    webhook_app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False)

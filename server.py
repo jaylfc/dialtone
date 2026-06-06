@@ -744,6 +744,112 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Settings API
+# ═══════════════════════════════════════════════════════════════════
+
+def get_settings():
+    """Read current settings from .env."""
+    settings = {}
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    settings[k.strip()] = v.strip().strip('"').strip("'")
+    return settings
+
+
+def update_setting(key, value):
+    """Update a single setting in .env."""
+    env_path = Path(__file__).parent / ".env"
+    lines = []
+    found = False
+
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith(f"{key}="):
+                    lines.append(f'{key}="{value}"\n')
+                    found = True
+                else:
+                    lines.append(line)
+
+    if not found:
+        lines.append(f'{key}="{value}"\n')
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+    # Update in-memory
+    os.environ[key] = value
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_get_settings():
+    """Get current settings."""
+    settings = get_settings()
+    # Mask sensitive values
+    masked = {}
+    for k, v in settings.items():
+        if any(s in k.upper() for s in ["TOKEN", "KEY", "SECRET", "AUTH"]):
+            if len(v) > 8:
+                masked[k] = v[:4] + "..." + v[-4:]
+            else:
+                masked[k] = "***"
+        else:
+            masked[k] = v
+
+    # Add computed info
+    masked["_status"] = {
+        "twilio": bool(TWILIO_SID),
+        "deepgram": bool(DEEPGRAM_KEY),
+        "llm": bool(llm_client),
+        "voice_engine": voice_engine.mode if voice_engine else "none",
+    }
+
+    # Available TTS voices (Twilio Polly voices)
+    masked["_available_voices"] = [
+        {"id": "Polly.Amy", "name": "Amy", "lang": "en-GB", "gender": "Female"},
+        {"id": "Polly.Brian", "name": "Brian", "lang": "en-GB", "gender": "Male"},
+        {"id": "Polly.Emma", "name": "Emma", "lang": "en-GB", "gender": "Female"},
+        {"id": "Polly.Joanna", "name": "Joanna", "lang": "en-US", "gender": "Female"},
+        {"id": "Polly.Matthew", "name": "Matthew", "lang": "en-US", "gender": "Male"},
+        {"id": "Polly.Ivy", "name": "Ivy", "lang": "en-US", "gender": "Female"},
+        {"id": "Polly.Justin", "name": "Justin", "lang": "en-US", "gender": "Male"},
+        {"id": "Polly.Kendra", "name": "Kendra", "lang": "en-US", "gender": "Female"},
+        {"id": "Polly.Kimberly", "name": "Kimberly", "lang": "en-US", "gender": "Female"},
+        {"id": "Polly.Salli", "name": "Salli", "lang": "en-US", "gender": "Female"},
+        {"id": "Polly.Nicole", "name": "Nicole", "lang": "en-AU", "gender": "Female"},
+        {"id": "Polly.Russell", "name": "Russell", "lang": "en-AU", "gender": "Male"},
+    ]
+
+    return jsonify(masked)
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_update_settings():
+    """Update settings."""
+    data = request.json or {}
+    allowed = [
+        "COMPANY_NAME", "VOICEMAIL_EMAIL", "VOICEMAIL_PIN",
+        "VOICEMAIL_GREETING", "VOICEMAIL_MAX_LENGTH",
+        "TTS_VOICE", "TTS_LANGUAGE", "USE_LOCAL_VOICE",
+        "CALL_GOAL", "CALL_SYSTEM_PROMPT",
+    ]
+
+    updated = []
+    for key, value in data.items():
+        if key in allowed:
+            update_setting(key, str(value))
+            updated.append(key)
+
+    return jsonify({"status": "ok", "updated": updated})
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Web Dashboard
 # ═══════════════════════════════════════════════════════════════════
 
@@ -759,6 +865,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 24px 32px; border-bottom: 1px solid #333; }
         .header h1 { font-size: 24px; font-weight: 600; }
         .header .subtitle { color: #888; font-size: 14px; margin-top: 4px; }
+        .nav { display: flex; gap: 0; padding: 0 32px; background: #111; border-bottom: 1px solid #222; }
+        .nav a { padding: 12px 20px; color: #888; text-decoration: none; font-size: 14px; border-bottom: 2px solid transparent; transition: all 0.15s; }
+        .nav a:hover { color: #e0e0e0; }
+        .nav a.active { color: #fff; border-bottom-color: #3b82f6; }
         .status-bar { display: flex; gap: 16px; padding: 16px 32px; background: #111; border-bottom: 1px solid #222; }
         .status-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
         .dot { width: 8px; height: 8px; border-radius: 50%; }
@@ -788,6 +898,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .call-form { display: flex; gap: 8px; margin-bottom: 16px; }
         .call-form input { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #e0e0e0; font-size: 14px; }
         audio { width: 200px; height: 32px; }
+        /* Settings */
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; font-weight: 500; }
+        .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: #e0e0e0; font-size: 14px; font-family: inherit; }
+        .form-group textarea { min-height: 80px; resize: vertical; }
+        .form-group select { cursor: pointer; }
+        .form-group .hint { font-size: 11px; color: #666; margin-top: 4px; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .save-bar { position: sticky; bottom: 0; padding: 16px 0; background: linear-gradient(transparent, #0a0a0a 20%); display: flex; justify-content: flex-end; gap: 8px; }
+        .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 100; animation: fadeIn 0.2s; }
+        .toast.success { background: #065f46; color: #6ee7b7; border: 1px solid #059669; }
+        .toast.error { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+        .badge.green { background: #065f46; color: #6ee7b7; }
+        .badge.red { background: #7f1d1d; color: #fca5a5; }
+        .badge.yellow { background: #78350f; color: #fcd34d; }
+        .page { display: none; }
+        .page.active { display: block; }
     </style>
 </head>
 <body>
@@ -795,10 +924,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h1>📞 Hermes Phone</h1>
         <div class="subtitle">AI-powered phone agent</div>
     </div>
+    <div class="nav">
+        <a href="#" class="active" onclick="showPage('dashboard')">Dashboard</a>
+        <a href="#" onclick="showPage('settings')">Settings</a>
+    </div>
     <div class="status-bar" id="status-bar">
         <div class="status-item"><div class="dot" id="status-dot"></div><span id="status-text">Loading...</span></div>
     </div>
-    <div class="container">
+
+    <!-- Dashboard Page -->
+    <div class="container page active" id="page-dashboard">
         <div class="section">
             <h2>Make a Call</h2>
             <div class="call-form">
@@ -817,7 +952,121 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
     </div>
+
+    <!-- Settings Page -->
+    <div class="container page" id="page-settings">
+        <div class="section">
+            <h2>Company & Voicemail</h2>
+            <div class="card" style="padding: 24px;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Company Name</label>
+                        <input type="text" id="set-COMPANY_NAME" placeholder="My Company">
+                    </div>
+                    <div class="form-group">
+                        <label>Voicemail Email</label>
+                        <input type="email" id="set-VOICEMAIL_EMAIL" placeholder="hello@company.com">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Voicemail Greeting</label>
+                    <textarea id="set-VOICEMAIL_GREETING" placeholder="Leave empty for default: 'Thank you for calling [company]. Please leave a message after the tone.'"></textarea>
+                    <div class="hint">Custom greeting played to callers. Leave empty for the default.</div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Voicemail PIN</label>
+                        <input type="text" id="set-VOICEMAIL_PIN" placeholder="1234">
+                        <div class="hint">Callers dial this during greeting to reach AI</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Max Recording (seconds)</label>
+                        <input type="number" id="set-VOICEMAIL_MAX_LENGTH" placeholder="120">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Voice</h2>
+            <div class="card" style="padding: 24px;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>TTS Voice</label>
+                        <select id="set-TTS_VOICE">
+                            <option value="">Loading voices...</option>
+                        </select>
+                        <div class="hint">Voice used for system messages (greeting, goodbye)</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Language</label>
+                        <select id="set-TTS_LANGUAGE">
+                            <option value="en-GB">English (UK)</option>
+                            <option value="en-US">English (US)</option>
+                            <option value="en-AU">English (AU)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Voice Engine</label>
+                    <select id="set-USE_LOCAL_VOICE">
+                        <option value="auto">Auto (local if available, else cloud)</option>
+                        <option value="true">Local Only (MLX on Apple Silicon)</option>
+                        <option value="false">Cloud Only (Deepgram/Edge TTS)</option>
+                    </select>
+                    <div class="hint">Local mode uses mlx-whisper + mlx-audio (zero API costs)</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>AI Agent</h2>
+            <div class="card" style="padding: 24px;">
+                <div class="form-group">
+                    <label>Call Goal</label>
+                    <input type="text" id="set-CALL_GOAL" placeholder="Have a helpful conversation.">
+                    <div class="hint">What the AI should try to achieve during calls</div>
+                </div>
+                <div class="form-group">
+                    <label>System Prompt</label>
+                    <textarea id="set-CALL_SYSTEM_PROMPT" placeholder="Leave empty for default behavior"></textarea>
+                    <div class="hint">Custom instructions for the AI during calls</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Service Status</h2>
+            <div class="card" style="padding: 24px;">
+                <div id="service-status">Loading...</div>
+            </div>
+        </div>
+
+        <div class="save-bar">
+            <button class="btn" onclick="loadSettings()">Reset</button>
+            <button class="btn primary" onclick="saveSettings()">💾 Save Settings</button>
+        </div>
+    </div>
+
     <script>
+        // Navigation
+        function showPage(name) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+            document.getElementById('page-' + name).classList.add('active');
+            event.target.classList.add('active');
+            if (name === 'settings') loadSettings();
+        }
+
+        function toast(msg, type='success') {
+            const el = document.createElement('div');
+            el.className = 'toast ' + type;
+            el.textContent = msg;
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 3000);
+        }
+
+        // Status
         async function loadStatus() {
             try {
                 const r = await fetch('/health');
@@ -828,6 +1077,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     : 'Offline';
             } catch { document.getElementById('status-dot').className = 'dot red'; document.getElementById('status-text').textContent = 'Offline'; }
         }
+
+        // Voicemails
         async function loadVoicemails() {
             try {
                 const r = await fetch('/voicemails');
@@ -850,20 +1101,84 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 `).join('');
             } catch(e) { console.error(e); }
         }
+
         async function deleteVM(sid) {
             if (!confirm('Delete this voicemail?')) return;
             await fetch('/voicemails/' + sid, {method:'DELETE'});
             loadVoicemails(); loadStatus();
         }
+
         async function makeCall() {
             const num = document.getElementById('call-number').value;
             if (!num) return alert('Enter a phone number');
             const r = await fetch('/call', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({to:num})});
             const d = await r.json();
-            alert(d.sid ? 'Calling ' + num + '...' : 'Error: ' + d.error);
+            toast(d.sid ? 'Calling ' + num + '...' : 'Error: ' + d.error, d.sid ? 'success' : 'error');
         }
+
         function exportAll() { window.location = '/export/zip'; }
         function exportTranscripts() { window.location = '/export/transcripts'; }
+
+        // Settings
+        let currentSettings = {};
+        let availableVoices = [];
+
+        async function loadSettings() {
+            try {
+                const r = await fetch('/api/settings');
+                const data = await r.json();
+                currentSettings = data;
+                availableVoices = data._available_voices || [];
+
+                // Populate voice dropdown
+                const voiceSelect = document.getElementById('set-TTS_VOICE');
+                voiceSelect.innerHTML = availableVoices.map(v =>
+                    `<option value="${v.id}" ${v.id === data.TTS_VOICE ? 'selected' : ''}>${v.name} (${v.lang}, ${v.gender})</option>`
+                ).join('');
+
+                // Populate form fields
+                const fields = ['COMPANY_NAME', 'VOICEMAIL_EMAIL', 'VOICEMAIL_GREETING', 'VOICEMAIL_PIN',
+                    'VOICEMAIL_MAX_LENGTH', 'TTS_LANGUAGE', 'USE_LOCAL_VOICE', 'CALL_GOAL', 'CALL_SYSTEM_PROMPT'];
+                fields.forEach(f => {
+                    const el = document.getElementById('set-' + f);
+                    if (el && data[f] !== undefined) el.value = data[f];
+                });
+
+                // Service status
+                const st = data._status || {};
+                document.getElementById('service-status').innerHTML = `
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                        <div>Twilio: <span class="badge ${st.twilio?'green':'red'}">${st.twilio?'Connected':'Not configured'}</span></div>
+                        <div>Deepgram: <span class="badge ${st.deepgram?'green':'red'}">${st.deepgram?'Connected':'Not configured'}</span></div>
+                        <div>LLM: <span class="badge ${st.llm?'green':'red'}">${st.llm?'Connected':'Not configured'}</span></div>
+                        <div>Voice Engine: <span class="badge ${st.voice_engine.includes('local')?'green':'yellow'}">${st.voice_engine}</span></div>
+                    </div>
+                `;
+            } catch(e) { console.error(e); }
+        }
+
+        async function saveSettings() {
+            const fields = ['COMPANY_NAME', 'VOICEMAIL_EMAIL', 'VOICEMAIL_GREETING', 'VOICEMAIL_PIN',
+                'VOICEMAIL_MAX_LENGTH', 'TTS_VOICE', 'TTS_LANGUAGE', 'USE_LOCAL_VOICE', 'CALL_GOAL', 'CALL_SYSTEM_PROMPT'];
+            const data = {};
+            fields.forEach(f => {
+                const el = document.getElementById('set-' + f);
+                if (el) data[f] = el.value;
+            });
+
+            try {
+                const r = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await r.json();
+                toast('Settings saved! Restart server to apply some changes.', 'success');
+            } catch(e) {
+                toast('Failed to save settings', 'error');
+            }
+        }
+
         loadStatus(); loadVoicemails();
         setInterval(() => { loadStatus(); loadVoicemails(); }, 15000);
     </script>

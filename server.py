@@ -66,6 +66,9 @@ VOICEMAIL_PIN = os.environ.get("VOICEMAIL_PIN", "1234")
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "My Company")
 VOICEMAIL_EMAIL = os.environ.get("VOICEMAIL_EMAIL", "")
 VOICEMAIL_MAX_LENGTH = int(os.environ.get("VOICEMAIL_MAX_LENGTH", "120"))
+VOICEMAIL_GREETING = os.environ.get("VOICEMAIL_GREETING", "")
+TTS_VOICE = os.environ.get("TTS_VOICE", "Polly.Amy")
+TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "en-GB")
 CALL_GOAL = os.environ.get("CALL_GOAL", "Have a helpful conversation.")
 SYSTEM_PROMPT = os.environ.get("CALL_SYSTEM_PROMPT", "")
 
@@ -363,23 +366,26 @@ def handle_incoming():
 
     resp = VoiceResponse()
 
-    # Build greeting
-    greeting = f"Thank you for calling {COMPANY_NAME}. "
-    greeting += "Your call is important to us but unfortunately we are unable to answer right now. "
-    greeting += "Please leave a message and we will get back to you as soon as possible"
-    if VOICEMAIL_EMAIL:
-        greeting += f", or if you prefer, you could email us at {VOICEMAIL_EMAIL}"
-    greeting += "."
+    # Build greeting — use custom or default
+    if VOICEMAIL_GREETING:
+        greeting = VOICEMAIL_GREETING
+    else:
+        greeting = f"Thank you for calling {COMPANY_NAME}. "
+        greeting += "Please leave a message after the tone."
+        if VOICEMAIL_EMAIL:
+            greeting += f" Or email us at {VOICEMAIL_EMAIL}."
+        else:
+            greeting += ""
 
     # Play greeting while listening for PIN
     gather = Gather(
         num_digits=len(VOICEMAIL_PIN),
         action="/voice/check-pin",
         method="POST",
-        timeout=5,
+        timeout=1,
         finish_on_key="#",
     )
-    gather.say(greeting, voice="Polly.Amy", language="en-GB")
+    gather.say(greeting, voice=TTS_VOICE, language=TTS_LANGUAGE)
     resp.append(gather)
 
     # If no PIN entered → beep and record voicemail
@@ -393,7 +399,7 @@ def handle_incoming():
         recording_status_callback_method="POST",
     )
 
-    resp.say("Goodbye.", voice="Polly.Amy", language="en-GB")
+    resp.say("Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
     return Response(str(resp), mimetype="text/xml")
 
 
@@ -409,7 +415,7 @@ def check_pin():
 
     if digits == VOICEMAIL_PIN:
         print(f"✅ PIN correct — connecting {caller} to AI")
-        resp.say("Connecting you now.", voice="Polly.Amy", language="en-GB")
+        resp.say("Connecting you now.", voice=TTS_VOICE, language=TTS_LANGUAGE)
         connect = Connect()
         connect.stream(url=f"wss://{request.host}/ws/call")
         resp.append(connect)
@@ -418,7 +424,7 @@ def check_pin():
         print(f"❌ Wrong PIN: {digits}")
         resp.say(
             "Please leave a message after the tone. Press hash when finished.",
-            voice="Polly.Amy", language="en-GB",
+            voice=TTS_VOICE, language=TTS_LANGUAGE,
         )
         resp.record(
             action="/voice/voicemail-complete",
@@ -459,7 +465,7 @@ def voicemail_complete():
     save_voicemails(voicemails)
 
     resp = VoiceResponse()
-    resp.say("Thank you for your message. Goodbye.", voice="Polly.Amy", language="en-GB")
+    resp.say("Thank you for your message. Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
 

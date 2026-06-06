@@ -848,18 +848,25 @@ def serve_voicemail_audio(sid):
 # All configurable settings with metadata
 # STT/TTS provider options for dropdown
 STT_PROVIDERS = [
-    {"id": "deepgram", "name": "Deepgram Nova-3", "type": "cloud", "cost": "$0.29/hr"},
+    # Cloud
+    {"id": "deepgram", "name": "Deepgram Nova-3", "type": "cloud", "cost": "$0.29/hr", "recommended": True},
     {"id": "assemblyai", "name": "AssemblyAI Universal-3", "type": "cloud", "cost": "$0.21/hr"},
     {"id": "google", "name": "Google Cloud STT", "type": "cloud", "cost": "$0.96/hr"},
     {"id": "azure", "name": "Azure Speech", "type": "cloud", "cost": "$1.00/hr"},
     {"id": "groq", "name": "Groq Whisper", "type": "cloud", "cost": "$0.04/hr"},
     {"id": "speechmatics", "name": "Speechmatics", "type": "cloud", "cost": "$0.24/hr"},
-    {"id": "whisper", "name": "OpenAI Whisper", "type": "cloud", "cost": "$0.06/hr"},
-    {"id": "local", "name": "Local (mlx-whisper)", "type": "local", "cost": "Free"},
-    {"id": "faster-whisper", "name": "faster-whisper", "type": "local", "cost": "Free"},
+    {"id": "whisper", "name": "OpenAI Whisper API", "type": "cloud", "cost": "$0.06/hr"},
+    # Local / Offline
+    {"id": "mlx-whisper", "name": "mlx-whisper (Apple Silicon)", "type": "local", "cost": "Free", "recommended": True},
+    {"id": "faster-whisper", "name": "faster-whisper (CTranslate2)", "type": "local", "cost": "Free"},
+    {"id": "whisper.cpp", "name": "whisper.cpp (C/C++)", "type": "local", "cost": "Free"},
+    {"id": "vosk", "name": "Vosk (offline, lightweight)", "type": "local", "cost": "Free"},
+    {"id": "wav2vec2", "name": "wav2vec2 (Meta)", "type": "local", "cost": "Free"},
+    {"id": "canary", "name": "NVIDIA Canary (local)", "type": "local", "cost": "Free"},
 ]
 
 TTS_PROVIDERS = [
+    # Cloud
     {"id": "polly", "name": "AWS Polly", "type": "cloud", "cost": "$16/1M chars"},
     {"id": "elevenlabs", "name": "ElevenLabs", "type": "cloud", "cost": "~$0.30/min"},
     {"id": "openai", "name": "OpenAI TTS", "type": "cloud", "cost": "$15/1M chars"},
@@ -867,9 +874,20 @@ TTS_PROVIDERS = [
     {"id": "google", "name": "Google Cloud TTS", "type": "cloud", "cost": "$16/1M chars"},
     {"id": "cartesia", "name": "Cartesia Sonic", "type": "cloud", "cost": "~$0.003/credit"},
     {"id": "deepgram_aura", "name": "Deepgram Aura", "type": "cloud", "cost": "$0.03/1K chars"},
-    {"id": "kokoro", "name": "Kokoro (local)", "type": "local", "cost": "Free"},
-    {"id": "edge", "name": "Edge TTS", "type": "cloud", "cost": "Free"},
+    {"id": "fish", "name": "Fish Audio", "type": "cloud", "cost": "~$0.03/min"},
+    {"id": "edge", "name": "Edge TTS (free)", "type": "cloud", "cost": "Free"},
     {"id": "mimo", "name": "MiMo TTS", "type": "cloud", "cost": "Free"},
+    # Local / Offline
+    {"id": "kokoro", "name": "Kokoro 82M (MLX)", "type": "local", "cost": "Free", "recommended": True},
+    {"id": "piper", "name": "Piper (C++, lightweight)", "type": "local", "cost": "Free"},
+    {"id": "coqui", "name": "Coqui XTTS v2", "type": "local", "cost": "Free"},
+    {"id": "bark", "name": "Bark (Suno)", "type": "local", "cost": "Free"},
+    {"id": "tortoise", "name": "Tortoise TTS", "type": "local", "cost": "Free"},
+    {"id": "vits", "name": "VITS / VITS2", "type": "local", "cost": "Free"},
+    {"id": "styletts2", "name": "StyleTTS 2", "type": "local", "cost": "Free"},
+    {"id": "chattts", "name": "ChatTTS", "type": "local", "cost": "Free"},
+    {"id": "sesame", "name": "Sesame CSM", "type": "local", "cost": "Free"},
+    {"id": "speecht5", "name": "SpeechT5 (Microsoft)", "type": "local", "cost": "Free"},
 ]
 
 SETTINGS_SCHEMA = {
@@ -907,6 +925,7 @@ SETTINGS_SCHEMA = {
     "OPENROUTER_API_KEY": {"label": "OpenRouter API Key", "type": "password", "section": "llm", "sensitive": True},
     "HERMES_GATEWAY_URL": {"label": "Hermes Gateway URL", "type": "text", "section": "hermes"},
     "HERMES_GATEWAY_TOKEN": {"label": "Hermes Gateway Token", "type": "password", "section": "hermes", "sensitive": True},
+    "HERMES_MODEL_OVERRIDE": {"label": "Model Override (calls)", "type": "text", "section": "hermes", "hint": "Leave empty for agent default"},
     "LLM_PROVIDER": {"label": "LLM Provider", "type": "select", "section": "llm"},
     "LLM_MODEL": {"label": "LLM Model", "type": "text", "section": "llm"},
     "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network"},

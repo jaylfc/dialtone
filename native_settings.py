@@ -115,6 +115,18 @@ STATIC_DROPDOWNS = {
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Window Delegate (stops modal loop on close)
+# ═══════════════════════════════════════════════════════════════════
+
+if HAS_APPKIT:
+    class _WindowDelegate(NSObject):
+        _parent = None
+
+        def windowWillClose_(self, notification):
+            NSApplication.sharedApplication().stopModal()
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Native Settings Window
 # ═══════════════════════════════════════════════════════════════════
 
@@ -181,6 +193,12 @@ class NativeSettingsWindow:
         self._load_settings()
 
         self.window.makeKeyAndOrderFront_(None)
+
+        # Delegate to stop modal loop when window is closed
+        delegate = _WindowDelegate.alloc().init()
+        delegate._parent = self
+        self.window.setDelegate_(delegate)
+
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
     def _build_tab_content(self, fields):
@@ -415,7 +433,14 @@ class NativeSettingsWindow:
         return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
 
 
+_active_window = None  # prevent GC
+
+
 def open_settings(api_url="http://localhost:5051", token=""):
-    """Entry point — call from menubar."""
-    win = NativeSettingsWindow(api_url=api_url, token=token)
-    win.show()
+    """Entry point — call from menubar (runs on main thread)."""
+    global _active_window
+    _active_window = NativeSettingsWindow(api_url=api_url, token=token)
+    _active_window.show()
+    # Run as modal — blocks until window is closed, keeps it alive
+    from AppKit import NSApplication
+    NSApplication.sharedApplication().runModalForWindow_(_active_window.window)

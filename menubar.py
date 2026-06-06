@@ -26,6 +26,9 @@ import rumps
 # ═══════════════════════════════════════════════════════════════════
 
 AGENT_DIR = Path(__file__).parent
+ICON_DIR = AGENT_DIR / "icons"
+ICON_GREEN = str(ICON_DIR / "phone_green.png")
+ICON_RED = str(ICON_DIR / "phone_red.png")
 HEALTH_URL = "http://localhost:5050/health"
 VOICEMAILS_URL = "http://localhost:5051/voicemails"
 SETTINGS_URL = "http://localhost:5051/api/settings"
@@ -453,7 +456,9 @@ class SettingsApi:
 
 class PhoneMenuBar(rumps.App):
     def __init__(self):
-        super().__init__("📞", quit_button=None)
+        # Start with red icon (not running)
+        icon = ICON_RED if Path(ICON_RED).exists() else None
+        super().__init__(name="Hermes Phone", title="", icon=icon, quit_button=None)
         self.running = False
         self.voicemails = []
         self.health_data = {}
@@ -509,7 +514,10 @@ class PhoneMenuBar(rumps.App):
         if data:
             self.health_data = data
         # Update icon color
-        self.title = "🟢" if running else "🔴"
+        icon_path = ICON_GREEN if running else ICON_RED
+        if Path(icon_path).exists():
+            self.icon = icon_path
+        self.title = ""  # No text, just the icon
         # Update menu state
         self.start_item.set_callback(None if not running else self.start_server)
         self.stop_item.set_callback(None if running else self.stop_server)

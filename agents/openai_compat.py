@@ -67,9 +67,24 @@ class OpenAICompatAgent(AgentBackend):
     def health_check(self) -> dict:
         try:
             import requests
+            # Try /models endpoint first (standard OpenAI)
             r = requests.get(f"{self.base_url}/models", timeout=3)
             if r.status_code == 200:
-                return {"ok": True}
+                return {"ok": True, "model": self.model}
+            # Some APIs don't have /models — try a minimal chat completion
+            if r.status_code in (401, 403):
+                return {"ok": False, "error": f"HTTP {r.status_code} (check API key)"}
+            if r.status_code == 404:
+                # Endpoint doesn't exist — try chat endpoint as fallback
+                try:
+                    r2 = requests.post(f"{self.base_url}/chat/completions", json={
+                        "model": self.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1
+                    }, timeout=5, headers={"Authorization": f"Bearer {self.api_key}"})
+                    if r2.status_code in (200, 400, 429):
+                        return {"ok": True, "model": self.model}
+                except Exception:
+                    pass
+                return {"ok": False, "error": "Endpoint not found"}
             return {"ok": False, "error": f"HTTP {r.status_code}"}
         except Exception as e:
             return {"ok": False, "error": str(e)}

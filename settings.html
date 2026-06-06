@@ -1093,15 +1093,24 @@ async function loadModels() {
   }
 }
 
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 function populateModelList(containerId, models) {
   const container = document.getElementById(containerId);
   if (!models.length) {
     container.innerHTML = '<div class="model-item" style="color:var(--text-ghost)">None found</div>';
     return;
   }
-  container.innerHTML = models.map(m =>
-    `<div class="model-item" onclick="selectModel('${m.replace(/'/g, "\\'")}')">${m}</div>`
-  ).join('');
+  container.innerHTML = '';
+  models.forEach(m => {
+    const div = document.createElement('div');
+    div.className = 'model-item';
+    div.textContent = m;
+    div.addEventListener('click', () => selectModel(m));
+    container.appendChild(div);
+  });
 }
 
 function selectModel(model) {

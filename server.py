@@ -351,7 +351,13 @@ def get_webhook_base():
     """Get the public URL for Twilio webhooks."""
     if WEBHOOK_URL_OVERRIDE:
         return WEBHOOK_URL_OVERRIDE.rstrip("/")
-    return f"https://{request.host}"
+    host = request.host
+    # Strip port if present — webhook URL should be the public-facing host
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    # Use HTTP for localhost/development, HTTPS for production
+    scheme = "http" if host in ("localhost", "127.0.0.1") else "https"
+    return f"{scheme}://{host}:{WEBHOOK_PORT}"
 
 # ═══════════════════════════════════════════════════════════════════
 # LLM — Pluggable agent backend
@@ -392,7 +398,7 @@ def synthesize_speech(text):
         if audio:
             return audio
 
-    if LLM_PROVIDER == "xiaomi" and XIAOMI_KEY:
+    if TTS_PROVIDER == "mimo" and XIAOMI_KEY:
         try:
             from openai import OpenAI
             client = OpenAI(base_url=XIAOMI_BASE_URL, api_key=XIAOMI_KEY)
@@ -491,7 +497,7 @@ def handle_incoming():
     if not VOICEMAIL_GREETING and VOICEMAIL_EMAIL:
         greeting += f" Or email us at {VOICEMAIL_EMAIL}."
 
-    gather = Gather(num_digits=len(VOICEMAIL_PIN), action="/voice/check-pin", method="POST",
+    gather = Gather(num_digits=max(len(VOICEMAIL_PIN), 4), action="/voice/check-pin", method="POST",
                     timeout=1, finish_on_key="#")
     gather.say(greeting, voice=TTS_VOICE, language=TTS_LANGUAGE)
     resp.append(gather)
@@ -510,7 +516,7 @@ def check_pin():
     print(f"🔑 PIN check: {digits} (expected {VOICEMAIL_PIN})")
 
     resp = VoiceResponse()
-    if digits == VOICEMAIL_PIN:
+    if VOICEMAIL_PIN and digits == VOICEMAIL_PIN:
         print(f"✅ PIN correct — connecting {caller} to AI")
         resp.say("Connecting you now.", voice=TTS_VOICE, language=TTS_LANGUAGE)
         connect = Connect()
@@ -690,13 +696,20 @@ def handle_ws(ws):
             dg_conn.close()
         print("🔌 WebSocket closed")
 
+import time as _time
+_health_cache = {"data": None, "ts": 0}
+_HEALTH_TTL = 30  # seconds
+
 @webhook_app.route("/health", methods=["GET"])
 @dashboard_app.route("/health", methods=["GET"])
 def health():
+    now = _time.time()
+    if _health_cache["data"] and now - _health_cache["ts"] < _HEALTH_TTL:
+        return jsonify(_health_cache["data"])
     backend = get_agent_backend()
     agent_health = backend.health_check()
 
-    return jsonify({
+    result = {
         "status": "ok",
         "twilio": bool(TWILIO_SID),
         "deepgram": bool(DEEPGRAM_KEY),
@@ -706,7 +719,10 @@ def health():
         "voicemails": len(load_voicemails()),
         "webhook_port": WEBHOOK_PORT,
         "dashboard_port": DASHBOARD_PORT,
-    })
+    }
+    _health_cache["data"] = result
+    _health_cache["ts"] = now
+    return jsonify(result)
 
 # ═══════════════════════════════════════════════════════════════════
 # DASHBOARD APP (port 5051 — auth protected)
@@ -902,6 +918,8 @@ def get_all_settings():
 
 def update_setting(key, value):
     """Update a single setting in .env."""
+    # Escape embedded quotes
+    safe_value = value.replace('"', '\\"').replace("'", "\\'")
     lines = []
     found = False
     if ENV_FILE.exists():
@@ -909,12 +927,12 @@ def update_setting(key, value):
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith(f"{key}="):
-                    lines.append(f'{key}="{value}"\n')
+                    lines.append(f'{key}="{safe_value}"\n')
                     found = True
                 else:
                     lines.append(line)
     if not found:
-        lines.append(f'\n{key}="{value}"\n')
+        lines.append(f'\n{key}="{safe_value}"\n')
     with open(ENV_FILE, "w") as f:
         f.writelines(lines)
     os.environ[key] = value

@@ -134,8 +134,9 @@ that https origin, and point the Twilio webhook at `<PUBLIC_URL>/voice/incoming`
   `TWILIO_AUTH_TOKEN` correct; disable only for local dev with `VALIDATE_TWILIO_SIGNATURE=false`).
 - **Dashboard & API** (`/`, `/call`, `/voicemails`, `/api/settings`, exports, `/health`) trust
   **direct localhost** automatically — the menu bar and a local browser just work. For remote
-  access through a tunnel, the installer generates `HERMES_API_TOKEN`; open
-  `<PUBLIC_URL>/?token=<HERMES_API_TOKEN>` (the token is then remembered by the browser).
+  access through a tunnel, the installer generates `HERMES_API_TOKEN`; open `<PUBLIC_URL>/`
+  and sign in with it (stored as an HttpOnly session cookie — never placed in a URL). API
+  clients pass it as `X-Hermes-Token` / `Authorization: Bearer`.
 - The PIN gate is **rate-limited** (`PIN_MAX_ATTEMPTS`, `PIN_LOCKOUT_WINDOW`).
 - `.env` is written `chmod 600`; debug mode is **off** by default (never enable it on a
   network-facing host).

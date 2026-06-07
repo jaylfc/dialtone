@@ -82,6 +82,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Security / networking
 API_TOKEN = os.environ.get("HERMES_API_TOKEN", "")
+SESSION_COOKIE = "hermes_session"
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")  # e.g. https://abc.ngrok.app
 DEBUG = os.environ.get("HERMES_DEBUG", "false").lower() in ("1", "true", "yes")
 VALIDATE_TWILIO = os.environ.get("VALIDATE_TWILIO_SIGNATURE", "true").lower() in ("1", "true", "yes")
@@ -188,29 +189,43 @@ def _request_via_proxy():
 
 
 def _token_ok():
+    """API clients authenticate with a header token (never a query string)."""
     if not API_TOKEN:
         return False
     sent = (
         request.headers.get("X-Hermes-Token", "")
         or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        or request.args.get("token", "")
     )
     return bool(sent) and secrets.compare_digest(sent, API_TOKEN)
 
 
+def _cookie_ok():
+    """Browsers authenticate with the HttpOnly session cookie set at login."""
+    if not API_TOKEN:
+        return False
+    sent = request.cookies.get(SESSION_COOKIE, "")
+    return bool(sent) and secrets.compare_digest(sent, API_TOKEN)
+
+
+def _is_local():
+    return not _request_via_proxy() and request.remote_addr in ("127.0.0.1", "::1")
+
+
 def require_auth(f):
-    """Protect the control plane: trust direct localhost, else require a token.
+    """Protect the control plane: trust direct localhost, else require auth.
 
     The menu bar and a local browser hit the server directly on 127.0.0.1 and
-    are trusted. Anything arriving through a tunnel/proxy, or from a remote host
-    (e.g. a forwarded port), must present HERMES_API_TOKEN.
+    are trusted. Anything arriving through a tunnel/proxy, or from a remote host,
+    must present a header token (API clients) or the session cookie (browsers,
+    obtained by signing in at /login with HERMES_API_TOKEN). Tokens are never
+    accepted in the URL, so they don't leak into logs or browser history.
     """
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if not _request_via_proxy() and request.remote_addr in ("127.0.0.1", "::1"):
+        if _is_local() or _token_ok() or _cookie_ok():
             return f(*args, **kwargs)
-        if _token_ok():
-            return f(*args, **kwargs)
+        if request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
+            return Response(LOGIN_HTML, mimetype="text/html", status=401)
         return jsonify({"error": "unauthorized"}), 401
     return wrapper
 
@@ -1012,6 +1027,34 @@ def api_update_settings():
 # Web Dashboard
 # ═══════════════════════════════════════════════════════════════════
 
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📞 Hermes Phone — Sign in</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .box { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 32px; width: 320px; }
+        h1 { font-size: 20px; margin-bottom: 4px; }
+        p { color: #888; font-size: 13px; margin-bottom: 20px; }
+        input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: #e0e0e0; font-size: 14px; }
+        button { width: 100%; margin-top: 12px; padding: 10px; border-radius: 8px; border: none; background: #1d4ed8; color: #fff; font-size: 14px; cursor: pointer; }
+        button:hover { background: #2563eb; }
+    </style>
+</head>
+<body>
+    <form class="box" method="POST" action="/login">
+        <h1>📞 Hermes Phone</h1>
+        <p>Enter your access token to continue.</p>
+        <input type="password" name="token" placeholder="Access token" autofocus autocomplete="current-password">
+        <button type="submit">Sign in</button>
+    </form>
+</body>
+</html>"""
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1208,16 +1251,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <script>
-        // Auth: localhost is trusted automatically; remote access needs ?token=...
-        // (stored once, then attached to every request).
-        const HERMES_TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('hermes_token') || '';
-        if (HERMES_TOKEN) localStorage.setItem('hermes_token', HERMES_TOKEN);
-        function tokenQS() { return HERMES_TOKEN ? ('?token=' + encodeURIComponent(HERMES_TOKEN)) : ''; }
-        const _fetch = window.fetch.bind(window);
-        window.fetch = (url, opts = {}) => {
-            if (HERMES_TOKEN) opts.headers = Object.assign({}, opts.headers, { 'X-Hermes-Token': HERMES_TOKEN });
-            return _fetch(url, opts);
-        };
+        // Auth is handled by the session cookie (localhost is trusted; remote signs in
+        // at /login). Same-origin requests send the cookie automatically — no token in URLs.
 
         // Navigation
         function showPage(name) {
@@ -1264,7 +1299,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             ${vm.transcript ? `<div class="vm-transcript">"${vm.transcript}"</div>` : '<div class="vm-transcript" style="color:#666">(no transcript)</div>'}
                         </div>
                         <div class="vm-actions">
-                            ${vm.audio_path ? `<audio controls src="/voicemails/${vm.sid}/audio${tokenQS()}"></audio>` : ''}
+                            ${vm.audio_path ? `<audio controls src="/voicemails/${vm.sid}/audio"></audio>` : ''}
                             <button class="btn danger" onclick="deleteVM('${vm.sid}')">🗑️</button>
                         </div>
                     </div>
@@ -1286,8 +1321,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             toast(d.sid ? 'Calling ' + num + '...' : 'Error: ' + d.error, d.sid ? 'success' : 'error');
         }
 
-        function exportAll() { window.location = '/export/zip' + tokenQS(); }
-        function exportTranscripts() { window.location = '/export/transcripts' + tokenQS(); }
+        function exportAll() { window.location = '/export/zip'; }
+        function exportTranscripts() { window.location = '/export/transcripts'; }
 
         // Settings
         let currentSettings = {};
@@ -1354,6 +1389,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Exchange the access token for an HttpOnly session cookie (remote browsers)."""
+    if _is_local() or _cookie_ok():
+        return Response("", status=303, headers={"Location": "/"})
+    if request.method == "POST":
+        token = request.form.get("token", "")
+        if API_TOKEN and secrets.compare_digest(token, API_TOKEN):
+            resp = Response("", status=303, headers={"Location": "/"})
+            resp.set_cookie(
+                SESSION_COOKIE, API_TOKEN,
+                httponly=True, samesite="Strict", secure=request.is_secure,
+                max_age=30 * 24 * 3600,
+            )
+            return resp
+        return Response(LOGIN_HTML, mimetype="text/html", status=401)
+    return Response(LOGIN_HTML, mimetype="text/html")
 
 
 @app.route("/", methods=["GET"])

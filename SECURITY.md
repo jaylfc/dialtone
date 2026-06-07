@@ -15,7 +15,7 @@ not be exposed unauthenticated.
 | Surface | Protection |
 |---|---|
 | `/voice/*` webhooks | Twilio request-signature validation (`X-Twilio-Signature`). Requires the correct `TWILIO_AUTH_TOKEN` and a matching `PUBLIC_URL`. |
-| Dashboard / API / `/call` / exports / `/health` | Trusts **direct localhost** only; any tunneled or remote request must present `HERMES_API_TOKEN`. |
+| Dashboard / API / `/call` / exports / `/health` | Trusts **direct localhost** only. Remote browsers sign in at `/login` (token → HttpOnly, Secure, SameSite=Strict cookie); API clients send `X-Hermes-Token` / `Authorization: Bearer`. Tokens are never accepted in query strings. |
 | PIN gate | Per-caller rate limiting + lockout (`PIN_MAX_ATTEMPTS`, `PIN_LOCKOUT_WINDOW`), constant-time compare. |
 | Settings writes | Values are sanitised before being written to `.env` (no newline/quote injection). |
 | Debugger | `debug` is **off** by default; only enable `HERMES_DEBUG=true` on a trusted localhost dev box. |
@@ -27,8 +27,8 @@ not be exposed unauthenticated.
   front and, ideally, only route `/voice/*` and `/ws/call` publicly.
 - Set `PUBLIC_URL` to your real https origin so signature validation and `wss://` Media
   Streams work.
-- Keep `HERMES_API_TOKEN` secret. For remote dashboard access use
-  `https://<host>/?token=<HERMES_API_TOKEN>`.
+- Keep `HERMES_API_TOKEN` secret. For remote dashboard access, open `https://<host>/` and
+  sign in; the token is stored as an HttpOnly cookie and never appears in a URL.
 - Rotate the token by editing `~/.hermes-phone/.env` and restarting the server.
 - Use a non-default `VOICEMAIL_PIN` of reasonable length.
 

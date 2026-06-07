@@ -159,9 +159,12 @@ class HermesPhoneApp(rumps.App):
         rumps.notification(TITLE, "", "Server stopped")
 
     def restart_server(self, _):
-        self.stop_server(None)
-        time.sleep(2)
-        self.start_server(None)
+        # Run off the menu/UI thread so the menu bar doesn't freeze during the sleep.
+        def _do_restart():
+            self.stop_server(None)
+            time.sleep(2)
+            self.start_server(None)
+        threading.Thread(target=_do_restart, daemon=True).start()
 
     # ── Health monitoring ───────────────────────────────────────────
 

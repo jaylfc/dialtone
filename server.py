@@ -15,16 +15,20 @@ import json
 import base64
 import time
 import audioop
+import secrets
 import threading
 import tempfile
 import subprocess
+from functools import wraps
 from pathlib import Path
 from datetime import datetime
 
 import requests as http_requests
 from flask import Flask, request, Response, jsonify
 from flask_sock import Sock
+from werkzeug.middleware.proxy_fix import ProxyFix
 from twilio.rest import Client as TwilioClient
+from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse, Connect, Gather
 from openai import OpenAI
 
@@ -75,6 +79,22 @@ SYSTEM_PROMPT = os.environ.get("CALL_SYSTEM_PROMPT", "")
 # Telegram (optional)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Security / networking
+API_TOKEN = os.environ.get("HERMES_API_TOKEN", "")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")  # e.g. https://abc.ngrok.app
+DEBUG = os.environ.get("HERMES_DEBUG", "false").lower() in ("1", "true", "yes")
+VALIDATE_TWILIO = os.environ.get("VALIDATE_TWILIO_SIGNATURE", "true").lower() in ("1", "true", "yes")
+HOST = os.environ.get("HERMES_HOST", "0.0.0.0")
+PORT = int(os.environ.get("HERMES_PORT", "5050"))
+PIN_MAX_ATTEMPTS = int(os.environ.get("PIN_MAX_ATTEMPTS", "5"))
+PIN_LOCKOUT_WINDOW = int(os.environ.get("PIN_LOCKOUT_WINDOW", "600"))
+
+# Cloud TTS (OpenAI) — fallback when local/MiMo voice is unavailable
+OPENAI_TTS_BASE_URL = os.environ.get("OPENAI_TTS_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+OPENAI_TTS_KEY = os.environ.get("OPENAI_TTS_API_KEY", OPENAI_KEY)
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
+OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "alloy")
 
 # Data directory
 DATA_DIR = Path(__file__).parent / "voicemails"
@@ -136,10 +156,107 @@ if DEEPGRAM_KEY and (not voice_engine or not voice_engine.stt):
 
 # Flask app
 app = Flask(__name__)
+# Honour X-Forwarded-Proto/Host from a single trusted tunnel/proxy (ngrok, etc.)
+# so signature validation and generated URLs reflect the real public address.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 sock = Sock(app)
+
+# Twilio webhook signature validator (uses the account Auth Token)
+twilio_validator = RequestValidator(TWILIO_TOKEN) if TWILIO_TOKEN else None
 
 # Call state (in-memory)
 call_states = {}
+
+# PIN brute-force tracking: caller -> (fail_count, window_start_ts)
+pin_attempts = {}
+
+# Serialises read-modify-write on the voicemail metadata file
+_vm_lock = threading.RLock()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Auth & request helpers
+# ═══════════════════════════════════════════════════════════════════
+
+def _request_via_proxy():
+    """True if the request arrived through a tunnel/reverse proxy (e.g. ngrok)."""
+    return bool(
+        request.headers.get("X-Forwarded-For")
+        or request.headers.get("X-Forwarded-Host")
+        or request.headers.get("X-Forwarded-Proto")
+    )
+
+
+def _token_ok():
+    if not API_TOKEN:
+        return False
+    sent = (
+        request.headers.get("X-Hermes-Token", "")
+        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        or request.args.get("token", "")
+    )
+    return bool(sent) and secrets.compare_digest(sent, API_TOKEN)
+
+
+def require_auth(f):
+    """Protect the control plane: trust direct localhost, else require a token.
+
+    The menu bar and a local browser hit the server directly on 127.0.0.1 and
+    are trusted. Anything arriving through a tunnel/proxy, or from a remote host
+    (e.g. a forwarded port), must present HERMES_API_TOKEN.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not _request_via_proxy() and request.remote_addr in ("127.0.0.1", "::1"):
+            return f(*args, **kwargs)
+        if _token_ok():
+            return f(*args, **kwargs)
+        return jsonify({"error": "unauthorized"}), 401
+    return wrapper
+
+
+def require_twilio(f):
+    """Reject webhook requests that aren't signed by Twilio."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if VALIDATE_TWILIO and twilio_validator is not None:
+            signature = request.headers.get("X-Twilio-Signature", "")
+            url = (PUBLIC_URL + request.path) if PUBLIC_URL else request.url
+            if not twilio_validator.validate(url, request.form.to_dict(), signature):
+                print(f"⛔ Invalid Twilio signature for {request.path}")
+                return Response("Invalid signature", status=403)
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def public_base():
+    """Public origin for building callback URLs (PUBLIC_URL or the request host)."""
+    return PUBLIC_URL if PUBLIC_URL else f"{request.scheme}://{request.host}"
+
+
+def public_ws_url(path):
+    """Twilio Media Streams require wss://; derive it from the public origin."""
+    return "wss://" + public_base().split("://", 1)[-1] + path
+
+
+def _pin_locked(caller):
+    """True if this caller has exhausted PIN attempts within the lockout window."""
+    rec = pin_attempts.get(caller)
+    if not rec:
+        return False
+    count, first = rec
+    if time.time() - first > PIN_LOCKOUT_WINDOW:
+        pin_attempts.pop(caller, None)
+        return False
+    return count >= PIN_MAX_ATTEMPTS
+
+
+def _record_pin_fail(caller):
+    count, first = pin_attempts.get(caller, (0, time.time()))
+    if time.time() - first > PIN_LOCKOUT_WINDOW:
+        count, first = 0, time.time()
+    pin_attempts[caller] = (count + 1, first)
+
 
 # Voicemail metadata
 def load_voicemails():
@@ -154,12 +271,13 @@ def save_voicemails(voicemails):
 # System prompt
 # ═══════════════════════════════════════════════════════════════════
 
-def get_system_prompt():
+def get_system_prompt(goal=None):
     if SYSTEM_PROMPT:
         return SYSTEM_PROMPT
+    goal = goal or CALL_GOAL
     return f"""You are {COMPANY_NAME}'s AI phone assistant.
 
-GOAL: {CALL_GOAL}
+GOAL: {goal}
 
 Rules:
 - Be natural, conversational, and concise (2-3 sentences max per turn)
@@ -181,7 +299,7 @@ def get_llm_response(call_sid, user_text):
     state = call_states.setdefault(call_sid, {"messages": [], "transcript": []})
     state["transcript"].append({"role": "user", "text": user_text})
 
-    messages = [{"role": "system", "content": get_system_prompt()}]
+    messages = [{"role": "system", "content": get_system_prompt(state.get("goal"))}]
     messages.extend(state["messages"])
     messages.append({"role": "user", "content": user_text})
 
@@ -235,19 +353,26 @@ def synthesize_speech(text):
         except Exception as e:
             print(f"MiMo TTS error: {e}")
 
-    # Fallback: OpenAI TTS (if key available)
-    if OPENAI_KEY:
+    # Fallback: OpenAI TTS (if a key is available).
+    # Request raw PCM (24 kHz, 16-bit, mono) and resample to 8 kHz for Twilio —
+    # no MP3/ffmpeg round-trip needed.
+    if OPENAI_TTS_KEY:
         try:
             resp = http_requests.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-                json={"model": "tts-1", "input": text, "voice": "alloy"},
+                f"{OPENAI_TTS_BASE_URL}/audio/speech",
+                headers={"Authorization": f"Bearer {OPENAI_TTS_KEY}"},
+                json={
+                    "model": OPENAI_TTS_MODEL,
+                    "input": text,
+                    "voice": OPENAI_TTS_VOICE,
+                    "response_format": "pcm",
+                },
                 timeout=30,
             )
-            if resp.status_code == 200:
-                # OpenAI returns MP3, convert to PCM
-                # For now, return None and let Twilio's <Say> handle it
-                pass
+            if resp.status_code == 200 and resp.content:
+                pcm_8k, _ = audioop.ratecv(resp.content, 2, 1, 24000, 8000, None)
+                return pcm_8k
+            print(f"OpenAI TTS error: {resp.status_code} {resp.text[:200]}")
         except Exception as e:
             print(f"OpenAI TTS error: {e}")
 
@@ -287,6 +412,27 @@ def send_audio_to_ws(ws, stream_sid, audio_data):
         print(f"Audio send error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════
+# Deepgram (prerecorded transcription)
+# ═══════════════════════════════════════════════════════════════════
+
+def _deepgram_transcribe(audio_bytes):
+    """Transcribe audio bytes with Deepgram (SDK v7 prerecorded API). Returns text or ""."""
+    if not dg_client:
+        return ""
+    response = dg_client.listen.v1.media.transcribe_file(
+        request=audio_bytes,
+        model="nova-2",
+        language="en",
+        punctuate=True,
+        smart_format=True,
+    )
+    try:
+        return response.results.channels[0].alternatives[0].transcript or ""
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Telegram notifications
 # ═══════════════════════════════════════════════════════════════════
 
@@ -312,14 +458,9 @@ def notify_telegram(recording_url, caller, duration, transcription=""):
         transcript_text = transcription
         if not transcript_text and dg_client:
             try:
-                from deepgram.options import PrerecordedOptions
                 with open(wav_path, "rb") as audio_file:
                     buffer_data = audio_file.read()
-                payload = {"buffer": buffer_data}
-                options = {"model": "nova-2", "language": "en", "punctuate": True}
-                response = dg_client.listen.rest.v("1").transcribe_file(payload, options)
-                if response and response.results:
-                    transcript_text = response.results.channels[0].alternatives[0].transcript
+                transcript_text = _deepgram_transcribe(buffer_data)
             except Exception as e:
                 print(f"⚠️ Deepgram transcription failed: {e}")
 
@@ -358,6 +499,7 @@ def notify_telegram(recording_url, caller, duration, transcription=""):
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/voice/incoming", methods=["POST"])
+@require_twilio
 def handle_incoming():
     """Handle incoming call — greeting with PIN capture."""
     call_sid = request.form.get("CallSid", "unknown")
@@ -404,24 +546,34 @@ def handle_incoming():
 
 
 @app.route("/voice/check-pin", methods=["POST"])
+@require_twilio
 def check_pin():
-    """Check if entered PIN matches."""
+    """Check if entered PIN matches (rate-limited per caller, constant-time)."""
     digits = request.form.get("Digits", "")
     call_sid = request.form.get("CallSid", "unknown")
     caller = request.form.get("From", "unknown")
-    print(f"🔑 PIN check: {digits} (expected {VOICEMAIL_PIN})")
 
     resp = VoiceResponse()
 
-    if digits == VOICEMAIL_PIN:
+    locked = _pin_locked(caller)
+    correct = (
+        not locked
+        and bool(VOICEMAIL_PIN)
+        and secrets.compare_digest(digits, VOICEMAIL_PIN)
+    )
+
+    if correct:
         print(f"✅ PIN correct — connecting {caller} to AI")
+        pin_attempts.pop(caller, None)
         resp.say("Connecting you now.", voice=TTS_VOICE, language=TTS_LANGUAGE)
         connect = Connect()
-        connect.stream(url=f"wss://{request.host}/ws/call")
+        connect.stream(url=public_ws_url("/ws/call"))
         resp.append(connect)
     else:
-        # Wrong PIN → voicemail (no hint that a PIN exists)
-        print(f"❌ Wrong PIN: {digits}")
+        # Wrong/locked-out PIN → voicemail (no hint that a PIN exists)
+        if not locked:
+            _record_pin_fail(caller)
+        print(f"❌ PIN rejected for {caller}")
         resp.say(
             "Please leave a message after the tone. Press hash when finished.",
             voice=TTS_VOICE, language=TTS_LANGUAGE,
@@ -440,6 +592,7 @@ def check_pin():
 
 
 @app.route("/voice/voicemail-complete", methods=["POST"])
+@require_twilio
 def voicemail_complete():
     """After voicemail recording is done."""
     call_sid = request.form.get("CallSid", "unknown")
@@ -450,19 +603,20 @@ def voicemail_complete():
 
     print(f"📩 Voicemail from {caller}: {duration}s, SID={recording_sid}")
 
-    # Store voicemail metadata
-    voicemails = load_voicemails()
-    voicemails.append({
-        "sid": recording_sid,
-        "from": caller,
-        "duration": int(duration),
-        "url": f"{recording_url}.wav",
-        "time": datetime.now().isoformat(),
-        "timestamp": time.time(),
-        "transcript": "",
-        "read": False,
-    })
-    save_voicemails(voicemails)
+    # Store voicemail metadata (serialised against the recording-ready worker)
+    with _vm_lock:
+        voicemails = load_voicemails()
+        voicemails.append({
+            "sid": recording_sid,
+            "from": caller,
+            "duration": int(duration or 0),
+            "url": f"{recording_url}.wav",
+            "time": datetime.now().isoformat(),
+            "timestamp": time.time(),
+            "transcript": "",
+            "read": False,
+        })
+        save_voicemails(voicemails)
 
     resp = VoiceResponse()
     resp.say("Thank you for your message. Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
@@ -471,6 +625,7 @@ def voicemail_complete():
 
 
 @app.route("/voice/recording-ready", methods=["POST"])
+@require_twilio
 def recording_ready():
     """Called when a voicemail recording is fully processed."""
     recording_sid = request.form.get("RecordingSid", "")
@@ -518,22 +673,19 @@ def _process_voicemail(recording_sid, recording_url, caller, duration, transcrip
 
         if not transcript and dg_client:
             try:
-                payload = {"buffer": r.content}
-                options = {"model": "nova-2", "language": "en", "punctuate": True}
-                response = dg_client.listen.rest.v("1").transcribe_file(payload, options)
-                if response and response.results:
-                    transcript = response.results.channels[0].alternatives[0].transcript
+                transcript = _deepgram_transcribe(r.content)
             except Exception as e:
                 print(f"⚠️ Deepgram transcription failed: {e}")
 
-        # Update metadata with transcript
-        voicemails = load_voicemails()
-        for vm in voicemails:
-            if vm["sid"] == recording_sid:
-                vm["transcript"] = transcript
-                vm["audio_path"] = str(audio_path)
-                break
-        save_voicemails(voicemails)
+        # Update metadata with transcript (serialised against other writers)
+        with _vm_lock:
+            voicemails = load_voicemails()
+            for vm in voicemails:
+                if vm.get("sid") == recording_sid:
+                    vm["transcript"] = transcript
+                    vm["audio_path"] = str(audio_path)
+                    break
+            save_voicemails(voicemails)
 
         # Telegram notification
         notify_telegram(recording_url, caller, duration, transcript)
@@ -549,6 +701,7 @@ def _process_voicemail(recording_sid, recording_url, caller, duration, transcrip
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/voice/outgoing", methods=["POST"])
+@require_twilio
 def handle_outgoing():
     """Handle outgoing call — connect to AI."""
     call_sid = request.form.get("CallSid", "unknown")
@@ -556,12 +709,13 @@ def handle_outgoing():
 
     resp = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f"wss://{request.host}/ws/call")
+    connect.stream(url=public_ws_url("/ws/call"))
     resp.append(connect)
     return Response(str(resp), mimetype="text/xml")
 
 
 @app.route("/voice/status", methods=["POST"])
+@require_twilio
 def handle_status():
     """Call status callback — logs transcript when call ends."""
     call_sid = request.form.get("CallSid", "")
@@ -676,9 +830,9 @@ def handle_ws(ws):
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/call", methods=["POST"])
+@require_auth
 def make_call():
     """Make an outbound call."""
-    global CALL_GOAL
     data = request.json or {}
     to_number = data.get("to", "")
     goal = data.get("goal", CALL_GOAL)
@@ -688,38 +842,38 @@ def make_call():
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
         return jsonify({"error": "Twilio not configured"}), 500
 
-    old_goal = CALL_GOAL
-    CALL_GOAL = goal
-
+    base = public_base()
     try:
         client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
             to=to_number,
             from_=TWILIO_FROM,
-            url=f"https://{request.host}/voice/outgoing",
-            status_callback=f"https://{request.host}/voice/status",
+            url=f"{base}/voice/outgoing",
+            status_callback=f"{base}/voice/status",
             status_callback_event=["completed", "failed", "busy", "no-answer"],
             timeout=30,
         )
-        CALL_GOAL = old_goal
+        # Remember this call's goal so the WebSocket turn uses it (keyed by CallSid)
+        call_states[call.sid] = {"messages": [], "transcript": [], "goal": goal}
         return jsonify({"sid": call.sid, "status": call.status, "to": to_number})
     except Exception as e:
-        CALL_GOAL = old_goal
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/voicemails", methods=["GET"])
+@require_auth
 def list_voicemails():
     """List all voicemails."""
     return jsonify(load_voicemails())
 
 
 @app.route("/voicemails/<sid>", methods=["DELETE"])
+@require_auth
 def delete_voicemail(sid):
     """Delete a voicemail."""
-    voicemails = load_voicemails()
-    voicemails = [vm for vm in voicemails if vm["sid"] != sid]
-    save_voicemails(voicemails)
+    with _vm_lock:
+        voicemails = [vm for vm in load_voicemails() if vm.get("sid") != sid]
+        save_voicemails(voicemails)
 
     # Delete audio file
     audio_path = AUDIO_DIR / f"{sid}.wav"
@@ -730,6 +884,7 @@ def delete_voicemail(sid):
 
 
 @app.route("/health", methods=["GET"])
+@require_auth
 def health():
     """Server health check."""
     return jsonify({
@@ -762,7 +917,9 @@ def get_settings():
 
 
 def update_setting(key, value):
-    """Update a single setting in .env."""
+    """Update a single setting in .env (value sanitised to prevent injection)."""
+    # Strip CR/LF and double-quotes so a value can't inject extra .env lines.
+    value = str(value).replace("\r", " ").replace("\n", " ").replace('"', "'")
     env_path = Path(__file__).parent / ".env"
     lines = []
     found = False
@@ -788,6 +945,7 @@ def update_setting(key, value):
 
 
 @app.route("/api/settings", methods=["GET"])
+@require_auth
 def api_get_settings():
     """Get current settings."""
     settings = get_settings()
@@ -830,6 +988,7 @@ def api_get_settings():
 
 
 @app.route("/api/settings", methods=["POST"])
+@require_auth
 def api_update_settings():
     """Update settings."""
     data = request.json or {}
@@ -1049,6 +1208,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <script>
+        // Auth: localhost is trusted automatically; remote access needs ?token=...
+        // (stored once, then attached to every request).
+        const HERMES_TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('hermes_token') || '';
+        if (HERMES_TOKEN) localStorage.setItem('hermes_token', HERMES_TOKEN);
+        function tokenQS() { return HERMES_TOKEN ? ('?token=' + encodeURIComponent(HERMES_TOKEN)) : ''; }
+        const _fetch = window.fetch.bind(window);
+        window.fetch = (url, opts = {}) => {
+            if (HERMES_TOKEN) opts.headers = Object.assign({}, opts.headers, { 'X-Hermes-Token': HERMES_TOKEN });
+            return _fetch(url, opts);
+        };
+
         // Navigation
         function showPage(name) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -1094,7 +1264,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             ${vm.transcript ? `<div class="vm-transcript">"${vm.transcript}"</div>` : '<div class="vm-transcript" style="color:#666">(no transcript)</div>'}
                         </div>
                         <div class="vm-actions">
-                            ${vm.audio_path ? `<audio controls src="/voicemails/${vm.sid}/audio"></audio>` : ''}
+                            ${vm.audio_path ? `<audio controls src="/voicemails/${vm.sid}/audio${tokenQS()}"></audio>` : ''}
                             <button class="btn danger" onclick="deleteVM('${vm.sid}')">🗑️</button>
                         </div>
                     </div>
@@ -1116,8 +1286,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             toast(d.sid ? 'Calling ' + num + '...' : 'Error: ' + d.error, d.sid ? 'success' : 'error');
         }
 
-        function exportAll() { window.location = '/export/zip'; }
-        function exportTranscripts() { window.location = '/export/transcripts'; }
+        function exportAll() { window.location = '/export/zip' + tokenQS(); }
+        function exportTranscripts() { window.location = '/export/transcripts' + tokenQS(); }
 
         // Settings
         let currentSettings = {};
@@ -1187,12 +1357,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
 @app.route("/", methods=["GET"])
+@require_auth
 def dashboard():
     """Web dashboard."""
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
 @app.route("/voicemails/<sid>/audio", methods=["GET"])
+@require_auth
 def serve_voicemail_audio(sid):
     """Serve voicemail audio file."""
     audio_path = AUDIO_DIR / f"{sid}.wav"
@@ -1202,6 +1374,7 @@ def serve_voicemail_audio(sid):
 
 
 @app.route("/export/zip", methods=["GET"])
+@require_auth
 def export_zip():
     """Export all voicemails as a ZIP file."""
     import zipfile
@@ -1243,6 +1416,7 @@ def export_zip():
 
 
 @app.route("/export/transcripts", methods=["GET"])
+@require_auth
 def export_transcripts():
     """Export transcripts as a text file."""
     voicemails = load_voicemails()
@@ -1273,7 +1447,9 @@ if __name__ == "__main__":
     print(f"   STT: {'Deepgram' if dg_client else '❌'}")
     print(f"   Twilio: {'✅' if TWILIO_SID else '❌'}")
     print(f"   LLM: {'✅' if llm_client else '❌'}")
-    print(f"   PIN: {VOICEMAIL_PIN}")
+    print(f"   PIN: {'set' if VOICEMAIL_PIN else 'unset'}")
     print(f"   Voicemails: {DATA_DIR}")
-    print(f"   Listening on 0.0.0.0:5050")
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    print(f"   Auth: {'token + localhost' if API_TOKEN else 'localhost-only (set HERMES_API_TOKEN for remote)'}")
+    print(f"   Twilio sig check: {'on' if (VALIDATE_TWILIO and twilio_validator) else 'OFF'}")
+    print(f"   Listening on {HOST}:{PORT} (debug={DEBUG})")
+    app.run(host=HOST, port=PORT, debug=DEBUG)

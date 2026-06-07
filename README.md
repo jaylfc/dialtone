@@ -107,19 +107,38 @@ The 📞 menu bar icon gives you:
 
 ## 🌐 Network Setup
 
-### Option A: Port Forwarding (Recommended)
-Forward port `5050` to your Mac's local IP. Point your Twilio webhook to:
-```
-http://YOUR_STATIC_IP:5050/voice/incoming
-```
+> **AI calls need HTTPS/WSS.** Twilio Media Streams only connect over `wss://`, so the
+> server must sit behind TLS. A plain `http://` port-forward works for voicemail but **not**
+> for live AI conversations — use a TLS tunnel or reverse proxy.
 
-### Option B: ngrok (Quick Setup)
+### Recommended: ngrok (or any TLS tunnel)
 ```bash
 brew install ngrok
 ngrok config add-authtoken YOUR_TOKEN
 ngrok http 5050
 ```
-Point Twilio webhook to the ngrok URL.
+Then in `~/.hermes-phone/.env` set `PUBLIC_URL` to the https URL ngrok prints, and point your
+Twilio Voice webhook to `<PUBLIC_URL>/voice/incoming`. `PUBLIC_URL` also lets the server verify
+Twilio's request signatures.
+
+### Advanced: static IP / domain with TLS
+Terminate TLS (Caddy, nginx, Cloudflare Tunnel, …) in front of port `5050`, set `PUBLIC_URL` to
+that https origin, and point the Twilio webhook at `<PUBLIC_URL>/voice/incoming`.
+
+> ⚠️ **Don't expose port 5050 directly to the internet.** Only `/voice/*` (Twilio,
+> signature-validated) and `/ws/call` need to be reachable. See [Security](#-security).
+
+## 🔒 Security
+
+- **Webhooks** are verified with Twilio request signatures (set `PUBLIC_URL` and keep
+  `TWILIO_AUTH_TOKEN` correct; disable only for local dev with `VALIDATE_TWILIO_SIGNATURE=false`).
+- **Dashboard & API** (`/`, `/call`, `/voicemails`, `/api/settings`, exports, `/health`) trust
+  **direct localhost** automatically — the menu bar and a local browser just work. For remote
+  access through a tunnel, the installer generates `HERMES_API_TOKEN`; open
+  `<PUBLIC_URL>/?token=<HERMES_API_TOKEN>` (the token is then remembered by the browser).
+- The PIN gate is **rate-limited** (`PIN_MAX_ATTEMPTS`, `PIN_LOCKOUT_WINDOW`).
+- `.env` is written `chmod 600`; debug mode is **off** by default (never enable it on a
+  network-facing host).
 
 ## 🤖 AI Provider Support
 

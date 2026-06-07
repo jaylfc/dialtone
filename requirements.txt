@@ -1,19 +1,21 @@
-flask>=3.0
+# Core runtime (pinned to compatible majors to avoid SDK API drift)
+flask>=3.0,<4
 flask-sock>=0.7
-twilio>=9.0
-openai>=1.50
+twilio>=9.0,<10
+openai>=1.50,<3
 requests>=2.31
-audioop-lts>=0.2
+deepgram-sdk>=7,<8          # cloud STT (live + voicemail transcription)
+
+# audioop was removed from the stdlib in Python 3.13 — backport for 3.13+
+audioop-lts>=0.2; python_version >= "3.13"
+
+# macOS menu bar app
 rumps>=0.4
 
-# Optional: Cloud STT (fallback if local not available)
-# deepgram-sdk>=4.0
-
-# Optional: Local voice (Apple Silicon MLX)
-# Install with: pip install mlx-whisper mlx-audio
-# Or run: python local_voice.py --install
+# Optional: Local voice (Apple Silicon MLX) — installed on demand by local_voice.py
+# Or run: pip install mlx-whisper mlx-audio
 # mlx-whisper
 # mlx-audio
 
-# Optional: Cloud TTS fallback (free, needs internet)
+# Optional: Cloud TTS fallback via Microsoft Edge voices (needs ffmpeg)
 # edge-tts

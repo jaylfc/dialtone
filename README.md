@@ -6,7 +6,7 @@ Inbound callers hit a PIN gate — enter the right PIN and you're connected to a
 
 ![macOS](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-green)
-![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)
+![License](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-blue)
 
 ---
 
@@ -346,9 +346,9 @@ pytest
 
 ## 📄 License
 
-**PolyForm Noncommercial License 1.0.0**
+**MIT License + [Commons Clause](https://commonsclause.com/)**
 
-Hermes Phone is **source-available** and free to use, modify, and share for any **non-commercial purpose**. Commercial use requires a separate license from the maintainer. This is not an OSI open-source license. See the [LICENSE](LICENSE) file for the full terms.
+Free to use, modify, and self-host. The Commons Clause adds a single restriction on top of MIT: you may **not Sell** the software — you can't charge for the software itself or offer it as a paid hosted/managed service whose value derives substantially from it. Everything else MIT permits is allowed. (Source-available; the Commons Clause means it is not an OSI open-source license.) See the [LICENSE](LICENSE) file for the full terms.
 
 ---
 

@@ -106,6 +106,30 @@ TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
 # Dashboard auth
 DASHBOARD_TOKEN = env("DASHBOARD_TOKEN")
 AUTH_COOKIE = "hp_auth"
+SESSION_TTL = 86400 * 30  # 30 days
+
+# Dashboard browser sessions: opaque session_id -> created_ts (in-memory, revocable).
+# The cookie holds a random id, NOT the dashboard token, so a leaked cookie can be
+# revoked and never exposes the master token.
+dashboard_sessions = {}
+
+
+def _new_session():
+    sid = secrets.token_urlsafe(32)
+    dashboard_sessions[sid] = time.time()
+    return sid
+
+
+def _session_valid(sid):
+    if not sid:
+        return False
+    created = dashboard_sessions.get(sid)
+    if created is None:
+        return False
+    if time.time() - created > SESSION_TTL:
+        dashboard_sessions.pop(sid, None)
+        return False
+    return True
 
 # Webhook URL override (use if behind a proxy or different URL)
 WEBHOOK_URL_OVERRIDE = env("WEBHOOK_URL_OVERRIDE")
@@ -282,20 +306,19 @@ def require_dashboard_auth():
     path = request.path
     if path in ("/login", "/logout", "/health"):
         return None
-    # Check cookie
-    cookie = request.cookies.get(AUTH_COOKIE, "")
-    if check_auth(cookie):
+    if not DASHBOARD_TOKEN:
+        return None  # No token configured = open (first run)
+    # Valid session cookie?
+    if _session_valid(request.cookies.get(AUTH_COOKIE, "")):
         return None
-    # Check Authorization header
+    # Authorization: Bearer <token> (API clients)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer ") and check_auth(auth[7:]):
         return None
-    # Check token query param (for auto-login from menubar)
+    # One-time ?token= bootstrap (e.g. menubar) → a session cookie is issued below
     token = request.args.get("token", "")
     if token and check_auth(token):
-        # Set cookie for future requests
-        resp = None  # Let the request through, cookie set on response
-        request._auto_auth_token = token
+        request._issue_session = True
         return None
     if path.startswith("/api/"):
         return jsonify({"error": "Unauthorized"}), 401
@@ -334,6 +357,9 @@ def init_voice_engine():
 # ═══════════════════════════════════════════════════════════════════
 # Voicemail helpers
 # ═══════════════════════════════════════════════════════════════════
+
+# Serialises read-modify-write on the voicemail metadata file
+_vm_lock = threading.RLock()
 
 def load_voicemails():
     if METADATA_FILE.exists():
@@ -387,12 +413,13 @@ def get_caller_info(form_data):
 # System prompt
 # ═══════════════════════════════════════════════════════════════════
 
-def get_system_prompt():
+def get_system_prompt(goal=None):
     if SYSTEM_PROMPT:
         return SYSTEM_PROMPT
+    goal = goal or CALL_GOAL
     return f"""You are {COMPANY_NAME}'s AI phone assistant.
 
-GOAL: {CALL_GOAL}
+GOAL: {goal}
 
 Rules:
 - Be natural, conversational, and concise (2-3 sentences max per turn)
@@ -432,7 +459,7 @@ def get_llm_response(call_sid, user_text):
         reply = backend.chat(
             call_sid=call_sid,
             user_text=user_text,
-            system_prompt=get_system_prompt(),
+            system_prompt=get_system_prompt(state.get("goal")),
             conversation_id=state["conversation_id"],
             history=state["messages"],
         )
@@ -640,13 +667,14 @@ def voicemail_complete():
     caller = get_caller_info(request.form)
     print(f"📩 Voicemail from {caller}: {duration}s, SID={recording_sid}")
 
-    voicemails = load_voicemails()
-    voicemails.append({
-        "sid": recording_sid, "from": caller, "duration": int(duration),
-        "url": f"{recording_url}.wav", "time": datetime.now().isoformat(),
-        "timestamp": time.time(), "transcript": "", "read": False,
-    })
-    save_voicemails(voicemails)
+    with _vm_lock:
+        voicemails = load_voicemails()
+        voicemails.append({
+            "sid": recording_sid, "from": caller, "duration": int(duration or 0),
+            "url": f"{recording_url}.wav", "time": datetime.now().isoformat(),
+            "timestamp": time.time(), "transcript": "", "read": False,
+        })
+        save_voicemails(voicemails)
 
     resp = VoiceResponse()
     resp.say("Thank you for your message. Goodbye.", voice=TTS_VOICE, language=TTS_LANGUAGE)
@@ -684,13 +712,14 @@ def _process_voicemail(recording_sid, recording_url, caller, duration, transcrip
         if not transcript:
             transcript = _deepgram_transcribe_file(r.content)
 
-        voicemails = load_voicemails()
-        for vm in voicemails:
-            if vm["sid"] == recording_sid:
-                vm["transcript"] = transcript
-                vm["audio_path"] = str(audio_path)
-                break
-        save_voicemails(voicemails)
+        with _vm_lock:
+            voicemails = load_voicemails()
+            for vm in voicemails:
+                if vm.get("sid") == recording_sid:
+                    vm["transcript"] = transcript
+                    vm["audio_path"] = str(audio_path)
+                    break
+            save_voicemails(voicemails)
         notify_telegram(recording_url, caller, duration, transcript)
         print(f"✅ Voicemail saved: {audio_path}")
     except Exception as e:
@@ -828,20 +857,21 @@ def login():
         token = data.get("token", "")
         if check_auth(token):
             resp = jsonify({"status": "ok"})
-            resp.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="Lax", max_age=86400 * 30)
+            resp.set_cookie(AUTH_COOKIE, _new_session(), httponly=True,
+                            samesite="Strict", secure=request.is_secure, max_age=SESSION_TTL)
             return resp
         return jsonify({"status": "error"}), 401
     return Response(LOGIN_HTML, mimetype="text/html")
 
 @dashboard_app.route("/logout", methods=["GET"])
 def logout():
+    dashboard_sessions.pop(request.cookies.get(AUTH_COOKIE, ""), None)
     resp = Response('<script>window.location="/login";</script>', mimetype="text/html")
     resp.delete_cookie(AUTH_COOKIE)
     return resp
 
 @dashboard_app.route("/call", methods=["POST"])
 def make_call():
-    global CALL_GOAL
     data = request.json or {}
     to_number = data.get("to", "")
     goal = data.get("goal", CALL_GOAL)
@@ -851,8 +881,6 @@ def make_call():
         return jsonify({"error": "Twilio not configured"}), 500
 
     webhook_base = WEBHOOK_URL_OVERRIDE or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
-    old_goal = CALL_GOAL
-    CALL_GOAL = goal
     try:
         client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
@@ -862,10 +890,14 @@ def make_call():
             status_callback_event=["completed", "failed", "busy", "no-answer"],
             timeout=30,
         )
-        CALL_GOAL = old_goal
+        # Remember this call's goal so the WS turn uses it (keyed by CallSid),
+        # instead of mutating a shared global that is reset before the call connects.
+        call_states[call.sid] = {
+            "messages": [], "transcript": [],
+            "conversation_id": f"call-{call.sid}", "goal": goal,
+        }
         return jsonify({"sid": call.sid, "status": call.status, "to": to_number})
     except Exception as e:
-        CALL_GOAL = old_goal
         return jsonify({"error": str(e)}), 500
 
 @dashboard_app.route("/voicemails", methods=["GET"])
@@ -874,9 +906,9 @@ def list_voicemails():
 
 @dashboard_app.route("/voicemails/<sid>", methods=["DELETE"])
 def delete_voicemail(sid):
-    voicemails = load_voicemails()
-    voicemails = [vm for vm in voicemails if vm["sid"] != sid]
-    save_voicemails(voicemails)
+    with _vm_lock:
+        voicemails = [vm for vm in load_voicemails() if vm.get("sid") != sid]
+        save_voicemails(voicemails)
     audio_path = AUDIO_DIR / f"{sid}.wav"
     if audio_path.exists():
         audio_path.unlink()
@@ -1011,7 +1043,8 @@ def get_all_settings():
 
 def update_setting(key, value):
     """Update a single setting in .env."""
-    # Escape embedded quotes
+    # Strip CR/LF (prevents injecting extra .env lines) and escape quotes.
+    value = str(value).replace("\r", " ").replace("\n", " ")
     safe_value = value.replace('"', '\\"').replace("'", "\\'")
     lines = []
     found = False
@@ -1165,10 +1198,10 @@ def export_transcripts():
 
 @dashboard_app.after_request
 def set_auth_cookie_from_token(response):
-    """Set auth cookie when token query param is used."""
-    token = getattr(request, '_auto_auth_token', None)
-    if token:
-        response.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="Lax", max_age=86400 * 30)
+    """Issue a session cookie after a successful ?token= bootstrap."""
+    if getattr(request, "_issue_session", False):
+        response.set_cookie(AUTH_COOKIE, _new_session(), httponly=True,
+                            samesite="Strict", secure=request.is_secure, max_age=SESSION_TTL)
     return response
 # ═══════════════════════════════════════════════════════════════════
 # Dashboard HTML (served from port 5051)

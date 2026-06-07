@@ -49,7 +49,7 @@ When `AGENT_PROVIDER` is set to `hermes-gateway` or left on `auto`, Dialtone aut
                         │               10 providers               │
                         │                    │                     │
                         │              ┌─────▼─────┐               │
-                        │              │  Voicemail│──→ Telegram   │
+                        │              │ Voicemail │──→ Telegram   │
                         │              └───────────┘               │
                         └──────────────────────────────────────────┘
 

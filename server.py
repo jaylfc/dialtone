@@ -203,10 +203,13 @@ def _validate_twilio_signature():
     """
     if not request.path.startswith("/voice/"):
         return None
-    if not (VALIDATE_TWILIO and twilio_validator):
+    # Read live so the Settings UI toggle / URL override apply without a restart.
+    validate = env("VALIDATE_TWILIO_SIGNATURE", "true").lower() in ("1", "true", "yes")
+    if not (validate and twilio_validator):
         return None
+    override = env("WEBHOOK_URL_OVERRIDE")
     signature = request.headers.get("X-Twilio-Signature", "")
-    url = (WEBHOOK_URL_OVERRIDE.rstrip("/") + request.path) if WEBHOOK_URL_OVERRIDE else request.url
+    url = (override.rstrip("/") + request.path) if override else request.url
     if not twilio_validator.validate(url, request.form.to_dict(), signature):
         print(f"⛔ Invalid Twilio signature for {request.path}")
         return Response("Invalid signature", status=403)
@@ -214,9 +217,10 @@ def _validate_twilio_signature():
 
 
 def _ws_url():
-    """Media Streams require wss://; honour WEBHOOK_URL_OVERRIDE when set."""
-    if WEBHOOK_URL_OVERRIDE:
-        host = WEBHOOK_URL_OVERRIDE.split("://", 1)[-1].rstrip("/")
+    """Media Streams require wss://; honour WEBHOOK_URL_OVERRIDE (read live) when set."""
+    override = env("WEBHOOK_URL_OVERRIDE")
+    if override:
+        host = override.split("://", 1)[-1].rstrip("/")
         return f"wss://{host}/ws/call"
     return f"wss://{request.host}/ws/call"
 
@@ -880,7 +884,7 @@ def make_call():
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
         return jsonify({"error": "Twilio not configured"}), 500
 
-    webhook_base = WEBHOOK_URL_OVERRIDE or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
+    webhook_base = env("WEBHOOK_URL_OVERRIDE") or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
     try:
         client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
@@ -998,24 +1002,36 @@ SETTINGS_SCHEMA = {
     "ASSEMBLYAI_API_KEY": {"label": "AssemblyAI API Key", "type": "password", "section": "stt", "sensitive": True},
     "GROQ_API_KEY": {"label": "Groq API Key", "type": "password", "section": "stt", "sensitive": True},
     "SPEECHMATICS_API_KEY": {"label": "Speechmatics API Key", "type": "password", "section": "stt", "sensitive": True},
+    "AZURE_SPEECH_KEY": {"label": "Azure Speech Key", "type": "password", "section": "stt", "sensitive": True, "hint": "Azure Cognitive Services speech key"},
+    "AZURE_SPEECH_REGION": {"label": "Azure Speech Region", "type": "text", "section": "stt", "hint": "e.g. eastus, westeurope"},
+    "GOOGLE_STT_CREDENTIALS": {"label": "Google STT Credentials File", "type": "text", "section": "stt", "hint": "Absolute path to Google Cloud service account JSON key file"},
     # TTS providers
     "TTS_PROVIDER": {"label": "TTS Provider", "type": "select", "section": "tts"},
     "ELEVENLABS_API_KEY": {"label": "ElevenLabs API Key", "type": "password", "section": "tts", "sensitive": True},
     "ELEVENLABS_VOICE_ID": {"label": "ElevenLabs Voice ID", "type": "text", "section": "tts"},
     "CARTESIA_API_KEY": {"label": "Cartesia API Key", "type": "password", "section": "tts", "sensitive": True},
     "CARTESIA_VOICE_ID": {"label": "Cartesia Voice ID", "type": "text", "section": "tts"},
+    "AZURE_TTS_KEY": {"label": "Azure TTS Key", "type": "password", "section": "tts", "sensitive": True, "hint": "Azure Cognitive Services speech key"},
+    "AZURE_TTS_REGION": {"label": "Azure TTS Region", "type": "text", "section": "tts", "hint": "e.g. eastus, westeurope"},
+    "GOOGLE_TTS_CREDENTIALS": {"label": "Google TTS Credentials File", "type": "text", "section": "tts", "hint": "Absolute path to Google Cloud service account JSON key file"},
+    "OPENAI_TTS_API_KEY": {"label": "OpenAI TTS API Key", "type": "password", "section": "tts", "sensitive": True, "hint": "Defaults to OPENAI_API_KEY if blank"},
+    "OPENAI_TTS_BASE_URL": {"label": "OpenAI TTS Base URL", "type": "text", "section": "tts", "default": "https://api.openai.com/v1", "hint": "Override for OpenAI-compatible TTS endpoint"},
+    "OPENAI_TTS_MODEL": {"label": "OpenAI TTS Model", "type": "text", "section": "tts", "default": "tts-1"},
+    "OPENAI_TTS_VOICE": {"label": "OpenAI TTS Voice", "type": "text", "section": "tts", "default": "alloy", "hint": "alloy, echo, fable, onyx, nova, shimmer"},
     "CALL_GOAL": {"label": "Call Goal", "type": "text", "section": "ai"},
     "CALL_SYSTEM_PROMPT": {"label": "System Prompt", "type": "textarea", "section": "ai"},
     # API keys (sensitive)
-    "TWILIO_ACCOUNT_SID": {"label": "Twilio Account SID", "type": "text", "section": "twilio", "sensitive": True},
-    "TWILIO_AUTH_TOKEN": {"label": "Twilio Auth Token", "type": "password", "section": "twilio", "sensitive": True},
-    "TWILIO_PHONE_NUMBER": {"label": "Twilio Phone Number", "type": "tel", "section": "twilio"},
-    "DEEPGRAM_API_KEY": {"label": "Deepgram API Key", "type": "password", "section": "deepgram", "sensitive": True},
+    "TWILIO_ACCOUNT_SID": {"label": "Twilio Account SID", "type": "password", "section": "twilio", "sensitive": True, "hint": "Starts with AC, 34 chars"},
+    "TWILIO_AUTH_TOKEN": {"label": "Twilio Auth Token", "type": "password", "section": "twilio", "sensitive": True, "hint": "32-char secret from console.twilio.com"},
+    "TWILIO_PHONE_NUMBER": {"label": "Twilio Phone Number", "type": "tel", "section": "twilio", "hint": "E.164 — country code + number, no spaces, e.g. +1XXXXXXXXXX"},
     "XIAOMI_API_KEY": {"label": "Xiaomi API Key", "type": "password", "section": "llm", "sensitive": True},
     "XIAOMI_BASE_URL": {"label": "Xiaomi Base URL", "type": "text", "section": "llm"},
     "OPENAI_API_KEY": {"label": "OpenAI API Key", "type": "password", "section": "llm", "sensitive": True},
     "OPENAI_BASE_URL": {"label": "OpenAI Base URL", "type": "text", "section": "llm"},
     "OPENROUTER_API_KEY": {"label": "OpenRouter API Key", "type": "password", "section": "llm", "sensitive": True},
+    "OPENROUTER_BASE_URL": {"label": "OpenRouter Base URL", "type": "text", "section": "llm", "default": "https://openrouter.ai/api/v1"},
+    "OLLAMA_BASE_URL": {"label": "Ollama Base URL", "type": "text", "section": "llm", "default": "http://localhost:11434/v1", "hint": "URL of your local Ollama instance"},
+    "LMSTUDIO_BASE_URL": {"label": "LM Studio Base URL", "type": "text", "section": "llm", "default": "http://localhost:1234/v1", "hint": "URL of your local LM Studio instance"},
     "HERMES_GATEWAY_URL": {"label": "Hermes Gateway URL", "type": "text", "section": "hermes"},
     "HERMES_GATEWAY_TOKEN": {"label": "Hermes Gateway Token", "type": "password", "section": "hermes", "sensitive": True},
     "HERMES_MODEL_OVERRIDE": {"label": "Model Override (calls)", "type": "text", "section": "hermes", "hint": "Leave empty for agent default"},
@@ -1024,9 +1040,15 @@ SETTINGS_SCHEMA = {
     "LLM_BASE_URL_OVERRIDE": {"label": "Custom Base URL", "type": "text", "section": "llm", "hint": "Override base URL for custom OpenAI-compatible endpoint"},
     "LLM_API_KEY_OVERRIDE": {"label": "Custom API Key", "type": "password", "section": "llm", "sensitive": True},
     "LLM_MODEL_OVERRIDE": {"label": "Custom Model", "type": "text", "section": "llm", "hint": "Override model name for custom endpoint"},
-    "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network"},
+    "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network", "hint": "Public https base Twilio reaches you at (tunnel/proxy). Applies live."},
+    "WEBHOOK_PORT": {"label": "Webhook Port (Twilio)", "type": "number", "section": "network", "default": "5050", "hint": "Restart required"},
+    "DASHBOARD_PORT": {"label": "Dashboard Port", "type": "number", "section": "network", "default": "5051", "hint": "Restart required"},
+    "VALIDATE_TWILIO_SIGNATURE": {"label": "Verify Twilio Signatures", "type": "select", "section": "network", "default": "true", "hint": "Reject unsigned webhooks. Set a correct Webhook URL Override first. Applies live."},
+    "PIN_MAX_ATTEMPTS": {"label": "PIN Max Attempts", "type": "number", "section": "network", "default": "5", "hint": "Restart required"},
+    "PIN_LOCKOUT_WINDOW": {"label": "PIN Lockout Window (seconds)", "type": "number", "section": "network", "default": "600", "hint": "Restart required"},
     "TELEGRAM_BOT_TOKEN": {"label": "Telegram Bot Token", "type": "password", "section": "telegram", "sensitive": True},
     "TELEGRAM_CHAT_ID": {"label": "Telegram Chat ID", "type": "text", "section": "telegram"},
+    "DASHBOARD_TOKEN": {"label": "Dashboard Password", "type": "password", "section": "general", "sensitive": True, "hint": "Changing this signs out existing dashboard sessions"},
 }
 
 def get_all_settings():
@@ -1079,7 +1101,7 @@ def api_get_settings():
     settings = get_all_settings()
     result = {}
     for key, schema in SETTINGS_SCHEMA.items():
-        val = settings.get(key, "")
+        val = settings.get(key, "") or schema.get("default", "")
         result[key] = mask_value(key, val) if schema.get("sensitive") else val
 
     # Service status

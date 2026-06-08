@@ -54,5 +54,5 @@ fi
 echo ""
 echo -e "${GREEN}✅ Hermes Phone uninstalled${NC}"
 echo ""
-echo -e "To reinstall: git clone https://github.com/jaylfc/hermes-phone && cd hermes-phone && ./install.sh"
+echo -e "To reinstall: git clone https://github.com/jaylfc/dialtone && cd dialtone && ./install.sh"
 echo ""

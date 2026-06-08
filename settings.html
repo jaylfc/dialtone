@@ -922,7 +922,28 @@ body {
       <div class="field">
         <label>Webhook URL Override</label>
         <input type="text" id="f-WEBHOOK_URL_OVERRIDE" placeholder="https://your-domain.com">
-        <div class="hint">Override the public URL for Twilio webhooks (use if behind a proxy)</div>
+        <div class="hint">Public https base Twilio reaches you at (tunnel/proxy). Applies live — no restart.</div>
+      </div>
+    </div>
+    <div class="group">
+      <div class="group-title">Security</div>
+      <div class="field">
+        <label>Verify Twilio Signatures</label>
+        <select id="f-VALIDATE_TWILIO_SIGNATURE">
+          <option value="true">Enabled (recommended)</option>
+          <option value="false">Disabled</option>
+        </select>
+        <div class="hint">Reject webhooks not signed by Twilio. Set a correct Webhook URL Override first, or inbound calls will 403. Applies live — no restart.</div>
+      </div>
+      <div class="field">
+        <label>PIN Max Attempts</label>
+        <input type="number" id="f-PIN_MAX_ATTEMPTS" placeholder="5" min="1" max="20">
+        <div class="hint">Wrong-PIN attempts before a caller is locked out. Restart required.</div>
+      </div>
+      <div class="field">
+        <label>PIN Lockout Window (seconds)</label>
+        <input type="number" id="f-PIN_LOCKOUT_WINDOW" placeholder="600" min="30">
+        <div class="hint">How long the lockout lasts. Restart required.</div>
       </div>
     </div>
     <div class="save-bar">
@@ -954,7 +975,7 @@ const TAB_KEYS = {
        'OPENROUTER_API_KEY','LLM_BASE_URL_OVERRIDE','LLM_API_KEY_OVERRIDE','LLM_MODEL_OVERRIDE',
        'CALL_GOAL','CALL_SYSTEM_PROMPT'],
   providers: ['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_PHONE_NUMBER','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'],
-  network: ['WEBHOOK_PORT','DASHBOARD_PORT','WEBHOOK_URL_OVERRIDE'],
+  network: ['WEBHOOK_PORT','DASHBOARD_PORT','WEBHOOK_URL_OVERRIDE','VALIDATE_TWILIO_SIGNATURE','PIN_MAX_ATTEMPTS','PIN_LOCKOUT_WINDOW'],
 };
 
 // Map STT providers to their key field rows

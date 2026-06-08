@@ -203,10 +203,13 @@ def _validate_twilio_signature():
     """
     if not request.path.startswith("/voice/"):
         return None
-    if not (VALIDATE_TWILIO and twilio_validator):
+    # Read live so the Settings UI toggle / URL override apply without a restart.
+    validate = env("VALIDATE_TWILIO_SIGNATURE", "true").lower() in ("1", "true", "yes")
+    if not (validate and twilio_validator):
         return None
+    override = env("WEBHOOK_URL_OVERRIDE")
     signature = request.headers.get("X-Twilio-Signature", "")
-    url = (WEBHOOK_URL_OVERRIDE.rstrip("/") + request.path) if WEBHOOK_URL_OVERRIDE else request.url
+    url = (override.rstrip("/") + request.path) if override else request.url
     if not twilio_validator.validate(url, request.form.to_dict(), signature):
         print(f"⛔ Invalid Twilio signature for {request.path}")
         return Response("Invalid signature", status=403)
@@ -214,9 +217,10 @@ def _validate_twilio_signature():
 
 
 def _ws_url():
-    """Media Streams require wss://; honour WEBHOOK_URL_OVERRIDE when set."""
-    if WEBHOOK_URL_OVERRIDE:
-        host = WEBHOOK_URL_OVERRIDE.split("://", 1)[-1].rstrip("/")
+    """Media Streams require wss://; honour WEBHOOK_URL_OVERRIDE (read live) when set."""
+    override = env("WEBHOOK_URL_OVERRIDE")
+    if override:
+        host = override.split("://", 1)[-1].rstrip("/")
         return f"wss://{host}/ws/call"
     return f"wss://{request.host}/ws/call"
 
@@ -880,7 +884,7 @@ def make_call():
     if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
         return jsonify({"error": "Twilio not configured"}), 500
 
-    webhook_base = WEBHOOK_URL_OVERRIDE or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
+    webhook_base = env("WEBHOOK_URL_OVERRIDE") or f"https://{request.host}".replace(f":{DASHBOARD_PORT}", f":{WEBHOOK_PORT}")
     try:
         client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         call = client.calls.create(
@@ -1024,7 +1028,12 @@ SETTINGS_SCHEMA = {
     "LLM_BASE_URL_OVERRIDE": {"label": "Custom Base URL", "type": "text", "section": "llm", "hint": "Override base URL for custom OpenAI-compatible endpoint"},
     "LLM_API_KEY_OVERRIDE": {"label": "Custom API Key", "type": "password", "section": "llm", "sensitive": True},
     "LLM_MODEL_OVERRIDE": {"label": "Custom Model", "type": "text", "section": "llm", "hint": "Override model name for custom endpoint"},
-    "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network"},
+    "WEBHOOK_URL_OVERRIDE": {"label": "Webhook URL Override", "type": "text", "section": "network", "hint": "Public https base Twilio reaches you at (tunnel/proxy). Applies live."},
+    "WEBHOOK_PORT": {"label": "Webhook Port (Twilio)", "type": "number", "section": "network", "default": "5050", "hint": "Restart required"},
+    "DASHBOARD_PORT": {"label": "Dashboard Port", "type": "number", "section": "network", "default": "5051", "hint": "Restart required"},
+    "VALIDATE_TWILIO_SIGNATURE": {"label": "Verify Twilio Signatures", "type": "select", "section": "network", "default": "true", "hint": "Reject unsigned webhooks. Set a correct Webhook URL Override first. Applies live."},
+    "PIN_MAX_ATTEMPTS": {"label": "PIN Max Attempts", "type": "number", "section": "network", "default": "5", "hint": "Restart required"},
+    "PIN_LOCKOUT_WINDOW": {"label": "PIN Lockout Window (seconds)", "type": "number", "section": "network", "default": "600", "hint": "Restart required"},
     "TELEGRAM_BOT_TOKEN": {"label": "Telegram Bot Token", "type": "password", "section": "telegram", "sensitive": True},
     "TELEGRAM_CHAT_ID": {"label": "Telegram Chat ID", "type": "text", "section": "telegram"},
 }
@@ -1079,7 +1088,7 @@ def api_get_settings():
     settings = get_all_settings()
     result = {}
     for key, schema in SETTINGS_SCHEMA.items():
-        val = settings.get(key, "")
+        val = settings.get(key, "") or schema.get("default", "")
         result[key] = mask_value(key, val) if schema.get("sensitive") else val
 
     # Service status

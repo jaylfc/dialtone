@@ -59,5 +59,5 @@ class TestDeepgramHelper:
 
 class TestWsUrl:
     def test_honours_webhook_override(self, monkeypatch):
-        monkeypatch.setattr(server, "WEBHOOK_URL_OVERRIDE", "https://pub.example.com")
+        monkeypatch.setenv("WEBHOOK_URL_OVERRIDE", "https://pub.example.com")  # read live now
         assert server._ws_url() == "wss://pub.example.com/ws/call"

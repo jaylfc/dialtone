@@ -560,7 +560,7 @@ body {
             <button class="btn btn-sm btn-danger" onclick="clearField('f-DASHBOARD_TOKEN')" title="Clear">✕</button>
           </div>
         </div>
-        <div class="hint">Leave empty for no auth (first run)</div>
+        <div class="hint">Changing this signs out existing dashboard sessions. Leave empty for no auth (first run).</div>
       </div>
     </div>
     <div class="save-bar">
@@ -619,6 +619,27 @@ body {
           </div>
         </div>
       </div>
+      <div class="field" id="row-AZURE_SPEECH_KEY" style="display:none">
+        <label>Azure Speech Key</label>
+        <div class="sensitive-wrap">
+          <input type="password" id="f-AZURE_SPEECH_KEY" placeholder="Enter Azure Cognitive Services speech key">
+          <div class="input-actions">
+            <button class="btn btn-sm btn-icon" onclick="toggleVis('f-AZURE_SPEECH_KEY')">👁</button>
+            <button class="btn btn-sm btn-danger" onclick="clearField('f-AZURE_SPEECH_KEY')">✕</button>
+          </div>
+        </div>
+        <div class="hint">Azure Cognitive Services speech key</div>
+      </div>
+      <div class="field" id="row-AZURE_SPEECH_REGION" style="display:none">
+        <label>Azure Speech Region</label>
+        <input type="text" id="f-AZURE_SPEECH_REGION" placeholder="eastus">
+        <div class="hint">e.g. eastus, westeurope</div>
+      </div>
+      <div class="field" id="row-GOOGLE_STT_CREDENTIALS" style="display:none">
+        <label>Google STT Credentials File</label>
+        <input type="text" id="f-GOOGLE_STT_CREDENTIALS" placeholder="/path/to/service-account.json">
+        <div class="hint">Absolute path to Google Cloud service account JSON key file</div>
+      </div>
     </div>
 
     <div class="group">
@@ -674,6 +695,52 @@ body {
       <div class="field" id="row-CARTESIA_VOICE_ID" style="display:none">
         <label>Cartesia Voice ID</label>
         <input type="text" id="f-CARTESIA_VOICE_ID" placeholder="Enter Cartesia voice ID">
+      </div>
+      <div class="field" id="row-AZURE_TTS_KEY" style="display:none">
+        <label>Azure TTS Key</label>
+        <div class="sensitive-wrap">
+          <input type="password" id="f-AZURE_TTS_KEY" placeholder="Enter Azure Cognitive Services speech key">
+          <div class="input-actions">
+            <button class="btn btn-sm btn-icon" onclick="toggleVis('f-AZURE_TTS_KEY')">👁</button>
+            <button class="btn btn-sm btn-danger" onclick="clearField('f-AZURE_TTS_KEY')">✕</button>
+          </div>
+        </div>
+        <div class="hint">Azure Cognitive Services speech key</div>
+      </div>
+      <div class="field" id="row-AZURE_TTS_REGION" style="display:none">
+        <label>Azure TTS Region</label>
+        <input type="text" id="f-AZURE_TTS_REGION" placeholder="eastus">
+        <div class="hint">e.g. eastus, westeurope</div>
+      </div>
+      <div class="field" id="row-GOOGLE_TTS_CREDENTIALS" style="display:none">
+        <label>Google TTS Credentials File</label>
+        <input type="text" id="f-GOOGLE_TTS_CREDENTIALS" placeholder="/path/to/service-account.json">
+        <div class="hint">Absolute path to Google Cloud service account JSON key file</div>
+      </div>
+      <div class="field" id="row-OPENAI_TTS_API_KEY" style="display:none">
+        <label>OpenAI TTS API Key</label>
+        <div class="sensitive-wrap">
+          <input type="password" id="f-OPENAI_TTS_API_KEY" placeholder="Defaults to OpenAI API Key if blank">
+          <div class="input-actions">
+            <button class="btn btn-sm btn-icon" onclick="toggleVis('f-OPENAI_TTS_API_KEY')">👁</button>
+            <button class="btn btn-sm btn-danger" onclick="clearField('f-OPENAI_TTS_API_KEY')">✕</button>
+          </div>
+        </div>
+        <div class="hint">Defaults to OPENAI_API_KEY if blank</div>
+      </div>
+      <div class="field" id="row-OPENAI_TTS_BASE_URL" style="display:none">
+        <label>OpenAI TTS Base URL</label>
+        <input type="text" id="f-OPENAI_TTS_BASE_URL" placeholder="https://api.openai.com/v1">
+        <div class="hint">Override for OpenAI-compatible TTS endpoint</div>
+      </div>
+      <div class="field" id="row-OPENAI_TTS_MODEL" style="display:none">
+        <label>OpenAI TTS Model</label>
+        <input type="text" id="f-OPENAI_TTS_MODEL" placeholder="tts-1">
+      </div>
+      <div class="field" id="row-OPENAI_TTS_VOICE" style="display:none">
+        <label>OpenAI TTS Voice</label>
+        <input type="text" id="f-OPENAI_TTS_VOICE" placeholder="alloy">
+        <div class="hint">alloy, echo, fable, onyx, nova, shimmer</div>
       </div>
       <div class="field">
         <label>Voice Engine (Local)</label>
@@ -798,6 +865,20 @@ body {
           </div>
         </div>
       </div>
+      <div class="field">
+        <label>OpenRouter Base URL</label>
+        <input type="text" id="f-OPENROUTER_BASE_URL" placeholder="https://openrouter.ai/api/v1">
+      </div>
+      <div class="field">
+        <label>Ollama Base URL</label>
+        <input type="text" id="f-OLLAMA_BASE_URL" placeholder="http://localhost:11434/v1">
+        <div class="hint">URL of your local Ollama instance</div>
+      </div>
+      <div class="field">
+        <label>LM Studio Base URL</label>
+        <input type="text" id="f-LMSTUDIO_BASE_URL" placeholder="http://localhost:1234/v1">
+        <div class="hint">URL of your local LM Studio instance</div>
+      </div>
     </div>
 
     <div class="group" id="section-custom-compat">
@@ -852,27 +933,29 @@ body {
       <div class="field">
         <label>Account SID</label>
         <div class="sensitive-wrap">
-          <input type="password" id="f-TWILIO_ACCOUNT_SID" placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+          <input type="password" id="f-TWILIO_ACCOUNT_SID" placeholder="AC................................" maxlength="34" pattern="AC[a-f0-9]{32}">
           <div class="input-actions">
             <button class="btn btn-sm btn-icon" onclick="toggleVis('f-TWILIO_ACCOUNT_SID')">👁</button>
             <button class="btn btn-sm btn-danger" onclick="clearField('f-TWILIO_ACCOUNT_SID')">✕</button>
           </div>
         </div>
+        <div class="hint">Starts with AC, 34 chars</div>
       </div>
       <div class="field">
         <label>Auth Token</label>
         <div class="sensitive-wrap">
-          <input type="password" id="f-TWILIO_AUTH_TOKEN" placeholder="Enter auth token">
+          <input type="password" id="f-TWILIO_AUTH_TOKEN" placeholder="Enter auth token" maxlength="32">
           <div class="input-actions">
             <button class="btn btn-sm btn-icon" onclick="toggleVis('f-TWILIO_AUTH_TOKEN')">👁</button>
             <button class="btn btn-sm btn-danger" onclick="clearField('f-TWILIO_AUTH_TOKEN')">✕</button>
           </div>
         </div>
+        <div class="hint">32-char secret from console.twilio.com</div>
       </div>
       <div class="field">
         <label>Phone Number</label>
-        <input type="tel" id="f-TWILIO_PHONE_NUMBER" placeholder="+447xxx">
-        <div class="hint">Your Twilio phone number in E.164 format</div>
+        <input type="tel" id="f-TWILIO_PHONE_NUMBER" placeholder="+1XXXXXXXXXX" pattern="\+[1-9]\d{6,14}">
+        <div class="hint">E.164 format, e.g. +1XXXXXXXXXX</div>
       </div>
     </div>
 
@@ -968,11 +1051,16 @@ const dirtyTabs = {};
 const TAB_KEYS = {
   general: ['COMPANY_NAME','VOICEMAIL_EMAIL','VOICEMAIL_GREETING','VOICEMAIL_PIN','VOICEMAIL_MAX_LENGTH','DASHBOARD_TOKEN'],
   voice: ['STT_PROVIDER','DEEPGRAM_API_KEY','ASSEMBLYAI_API_KEY','GROQ_API_KEY','SPEECHMATICS_API_KEY',
+          'AZURE_SPEECH_KEY','AZURE_SPEECH_REGION','GOOGLE_STT_CREDENTIALS',
           'TTS_PROVIDER','TTS_VOICE','TTS_LANGUAGE','ELEVENLABS_API_KEY','ELEVENLABS_VOICE_ID',
-          'CARTESIA_API_KEY','CARTESIA_VOICE_ID','USE_LOCAL_VOICE'],
+          'CARTESIA_API_KEY','CARTESIA_VOICE_ID',
+          'AZURE_TTS_KEY','AZURE_TTS_REGION','GOOGLE_TTS_CREDENTIALS',
+          'OPENAI_TTS_API_KEY','OPENAI_TTS_BASE_URL','OPENAI_TTS_MODEL','OPENAI_TTS_VOICE',
+          'USE_LOCAL_VOICE'],
   ai: ['AGENT_PROVIDER','HERMES_GATEWAY_URL','HERMES_GATEWAY_TOKEN','HERMES_MODEL_OVERRIDE',
        'LLM_PROVIDER','LLM_MODEL','XIAOMI_API_KEY','XIAOMI_BASE_URL','OPENAI_API_KEY','OPENAI_BASE_URL',
-       'OPENROUTER_API_KEY','LLM_BASE_URL_OVERRIDE','LLM_API_KEY_OVERRIDE','LLM_MODEL_OVERRIDE',
+       'OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OLLAMA_BASE_URL','LMSTUDIO_BASE_URL',
+       'LLM_BASE_URL_OVERRIDE','LLM_API_KEY_OVERRIDE','LLM_MODEL_OVERRIDE',
        'CALL_GOAL','CALL_SYSTEM_PROMPT'],
   providers: ['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_PHONE_NUMBER','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'],
   network: ['WEBHOOK_PORT','DASHBOARD_PORT','WEBHOOK_URL_OVERRIDE','VALIDATE_TWILIO_SIGNATURE','PIN_MAX_ATTEMPTS','PIN_LOCKOUT_WINDOW'],
@@ -984,12 +1072,17 @@ const STT_KEY_MAP = {
   'assemblyai': ['row-ASSEMBLYAI_API_KEY'],
   'groq': ['row-GROQ_API_KEY'],
   'speechmatics': ['row-SPEECHMATICS_API_KEY'],
+  'azure': ['row-AZURE_SPEECH_KEY','row-AZURE_SPEECH_REGION'],
+  'google': ['row-GOOGLE_STT_CREDENTIALS'],
 };
 
 // Map TTS providers to their key field rows
 const TTS_KEY_MAP = {
   'elevenlabs': ['row-ELEVENLABS_API_KEY','row-ELEVENLABS_VOICE_ID'],
   'cartesia': ['row-CARTESIA_API_KEY','row-CARTESIA_VOICE_ID'],
+  'azure': ['row-AZURE_TTS_KEY','row-AZURE_TTS_REGION'],
+  'google': ['row-GOOGLE_TTS_CREDENTIALS'],
+  'openai': ['row-OPENAI_TTS_API_KEY','row-OPENAI_TTS_BASE_URL','row-OPENAI_TTS_MODEL','row-OPENAI_TTS_VOICE'],
 };
 
 // ─── Toast ───

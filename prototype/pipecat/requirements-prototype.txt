@@ -2,7 +2,7 @@
 # Install: pip install -r requirements-prototype.txt
 
 # Core framework with all required service extras
-pipecat-ai[websocket,silero,deepgram,openai,cartesia]==0.0.98
+pipecat-ai[websocket,silero,deepgram,openai,cartesia]==1.2.0
 
 # FastAPI server + ASGI runner (pipecat's runner extra brings uvicorn,
 # but we pin explicit versions so the prototype is fully reproducible)

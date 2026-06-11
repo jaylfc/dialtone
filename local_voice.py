@@ -26,15 +26,20 @@ TTS_MODEL = "prince-canuma/Kokoro-82M-4bit"  # 4-bit quantized, ~50MB
 
 
 def ensure_models():
-    """Download models if not already present. Returns True if ready."""
+    """Check that the MLX voice packages are importable. Returns True if ready.
+
+    Never installs from here: running pip inside the long-lived server process
+    blocks boot and can crash on macOS (fork-after-framework-init, issue #51).
+    Install via install.sh or `python local_voice.py --install`.
+    """
     try:
-        import mlx_whisper
-        import mlx_audio
-        print("  ✅ MLX models already installed")
+        import mlx_whisper  # noqa: F401
+        import mlx_audio  # noqa: F401
         return True
     except ImportError:
-        print("  📦 Installing MLX voice models...")
-        return install_local_voice()
+        print("  ℹ️  MLX voice not installed — run `python local_voice.py --install` "
+              "(or pip install mlx-whisper mlx-audio) to enable local voice")
+        return False
 
 
 def install_local_voice():
@@ -307,3 +312,16 @@ class VoiceEngine:
     @property
     def is_available(self) -> bool:
         return self.mode != "none"
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Local voice engine utilities")
+    parser.add_argument("--install", action="store_true",
+                        help="Install mlx-whisper + mlx-audio into the current interpreter")
+    args = parser.parse_args()
+    if args.install:
+        ok = install_local_voice()
+        raise SystemExit(0 if ok else 1)
+    parser.print_help()

@@ -102,7 +102,7 @@ Healthy for its scale. The notable items are architectural (A3 blocking loop) an
 ### Dependencies
 
 **D1 — MEDIUM:** `requirements.txt` has **no platform markers** despite `README.md:370` claiming "Dependencies with platform markers" — `rumps`/`pywebview` are listed unconditionally, so `pip install -r requirements.txt` fails on Linux [F; the CI workflow comment admits this and hand-picks deps instead]. Consequently CI installs a hand-maintained, unpinned dep list (`.github/workflows/ci.yml:28-31`) that will drift from `requirements.txt`. No pins/lockfile anywhere (all `>=` ranges).
-Otherwise the dependency set is small and mainstream; no known-CVE red flags spotted (not exhaustively scanned — say so explicitly: no SCA tool was run).
+Otherwise the dependency set is small and mainstream. No SCA tool was run as part of this audit, but **GitHub reports 1 open high-severity Dependabot alert on the default branch** (https://github.com/jaylfc/dialtone/security/dependabot/1) — triage it as part of Milestone 1.
 
 ### DevEx & operations
 

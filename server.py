@@ -14,7 +14,6 @@ Voicemail: Record → Transcribe → Store locally + optional Telegram notificat
 """
 
 import os
-import sys
 import json
 import base64
 import time
@@ -24,11 +23,9 @@ import tempfile
 import subprocess
 import hmac
 import secrets
-import functools
-import uuid
 from pathlib import Path
 from datetime import datetime
-from provider_registry import PROVIDER_DEPS, check_provider_installed, get_provider_status
+from provider_registry import PROVIDER_DEPS, get_provider_status
 
 # Agent backend (lazy-loaded)
 from agents import get_agent_backend, DEFAULT_AGENT_PROVIDER
@@ -378,7 +375,7 @@ def init_voice_engine():
             if USE_LOCAL_VOICE == "true":
                 print(f"  ❌ Local voice failed: {e}")
             else:
-                print(f"  ℹ️  Local voice not available, using cloud TTS")
+                print("  ℹ️  Local voice not available, using cloud TTS")
 
     if DEEPGRAM_KEY and (not voice_engine or not voice_engine.stt):
         try:
@@ -635,7 +632,7 @@ def notify_telegram(recording_url, caller, duration, transcription=""):
                               files={"voice": ("voicemail.wav", audio_file, "audio/wav")}, timeout=30)
         try:
             os.unlink(wav_path)
-        except:
+        except OSError:
             pass
     except Exception as e:
         print(f"❌ Telegram notification error: {e}")
@@ -694,7 +691,6 @@ def check_pin():
 
 @webhook_app.route("/voice/voicemail-complete", methods=["POST"])
 def voicemail_complete():
-    call_sid = request.form.get("CallSid", "unknown")
     recording_url = request.form.get("RecordingUrl", "")
     recording_sid = request.form.get("RecordingSid", "")
     duration = request.form.get("RecordingDuration", "0")
@@ -875,14 +871,13 @@ def handle_ws(ws):
             dg_conn.close()
         print("🔌 WebSocket closed")
 
-import time as _time
 _health_cache = {"data": None, "ts": 0}
 _HEALTH_TTL = 30  # seconds
 
 @webhook_app.route("/health", methods=["GET"])
 @dashboard_app.route("/health", methods=["GET"])
 def health():
-    now = _time.time()
+    now = time.time()
     if _health_cache["data"] and now - _health_cache["ts"] < _HEALTH_TTL:
         return jsonify(_health_cache["data"])
     backend = get_agent_backend()
@@ -1230,7 +1225,8 @@ def list_models():
 
 @dashboard_app.route("/export/zip", methods=["GET"])
 def export_zip():
-    import zipfile, io
+    import zipfile
+    import io
     voicemails = load_voicemails()
     if not voicemails:
         return jsonify({"error": "No voicemails to export"}), 404
@@ -1258,7 +1254,7 @@ def export_zip():
 @dashboard_app.route("/export/transcripts", methods=["GET"])
 def export_transcripts():
     voicemails = load_voicemails()
-    lines = [f"Dialtone — Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
+    lines = ["Dialtone — Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
     for vm in voicemails:
         caller = vm.get("from", "unknown").replace("+", "")
         lines.append(f"From: {caller}")
@@ -1319,7 +1315,6 @@ def install_provider():
     
     # Run install in background thread
     def do_install():
-        import subprocess
         try:
             result = subprocess.run(
                 install_cmd.split(),
@@ -1358,7 +1353,7 @@ def run_dashboard():
 if __name__ == "__main__":
     init_voice_engine()
 
-    print(f"📞 Dialtone — AI Phone Agent")
+    print("📞 Dialtone — AI Phone Agent")
     print(f"   Company: {COMPANY_NAME}")
     backend = get_agent_backend()
     agent_health = backend.health_check()

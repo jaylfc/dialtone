@@ -11,7 +11,6 @@ Fallback: edge-tts (cloud), AVSpeechSynthesizer (native macOS)
 
 import os
 import sys
-import base64
 import audioop
 import subprocess
 from pathlib import Path
@@ -214,21 +213,12 @@ class NativeTTS:
     """Zero-dependency fallback using macOS AVSpeechSynthesizer."""
 
     def synthesize_for_twilio(self, text: str) -> bytes:
-        """Synthesize using macOS native TTS. Returns PCM16 at 8kHz."""
-        try:
-            import AVFoundation
-            import tempfile
+        """Synthesize using macOS native TTS. Returns PCM16 at 8kHz.
 
-            synth = AVFoundation.AVSpeechSynthesizer.new()
-            utterance = AVFoundation.AVSpeechUtterance.speechUtteranceWithString_(text)
-            utterance.setVoice_(AVFoundation.AVSpeechSynthesisVoice.voiceWithLanguage_("en-GB"))
-            utterance.setRate_(0.5)
-
-            # macOS native TTS doesn't easily output to bytes
-            # Fall through to edge-tts for now
-            return b""
-        except Exception:
-            return b""
+        Not implemented: AVSpeechSynthesizer has no straightforward
+        bytes-output path, so this engine always falls back to silence.
+        """
+        return b""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -271,13 +261,11 @@ class VoiceEngine:
 
     def _init_edge(self):
         """Try edge-tts (cloud)."""
-        try:
-            import edge_tts
+        import importlib.util
+        if importlib.util.find_spec("edge_tts"):
             self.tts = EdgeTTS()
             # STT still needs something local or Deepgram
             self.mode = "edge-cloud"
-        except ImportError:
-            pass
 
     def _init_native(self):
         """Last resort: macOS native."""

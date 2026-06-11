@@ -30,7 +30,8 @@ class TestApiSettings:
         assert data["WEBHOOK_PORT"] == "5050"
 
     def test_update_accepts_overrides(self, monkeypatch, tmp_path):
-        envf = tmp_path / ".env"; envf.write_text("")
+        envf = tmp_path / ".env"
+        envf.write_text("")
         monkeypatch.setattr(server, "ENV_FILE", envf)
         monkeypatch.setattr(server, "DASHBOARD_TOKEN", "")
         c = server.dashboard_app.test_client()

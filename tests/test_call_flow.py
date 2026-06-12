@@ -3,6 +3,8 @@ stream tokens that authenticate /ws/call (#66), and the live-STT turn
 assembly helper (#69 interim duplication, #25 speech_final turn boundary).
 """
 
+import base64
+import json
 import time
 
 import pytest
@@ -166,3 +168,78 @@ class TestTurnAssembly:
         buf = []
         assert server._accumulate_stt_message(_msg("", is_final=True, speech_final=False), buf) is False
         assert buf == []
+
+
+# ─── WS handler auth gating (pre-auth media must not reach STT) ──────────────
+
+class _FakeWS:
+    """Feeds a scripted message sequence to handle_ws, then closes."""
+
+    def __init__(self, messages):
+        self._messages = [json.dumps(m) for m in messages]
+        self.sent = []
+
+    def receive(self, timeout=None):
+        if self._messages:
+            return self._messages.pop(0)
+        raise ConnectionError("closed")
+
+    def send(self, data):
+        self.sent.append(data)
+
+
+class _FakeDGConn:
+    def __init__(self):
+        self.media_frames = []
+        self.closed = False
+
+    def on(self, *args, **kwargs):
+        pass
+
+    def send_media(self, audio):
+        self.media_frames.append(audio)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeDGClient:
+    def __init__(self, conn):
+        class _V1:
+            def connect(self, **kwargs):
+                return conn
+        class _Listen:
+            v1 = _V1()
+        self.listen = _Listen()
+
+
+def _media(payload=b"audio"):
+    return {"event": "media", "media": {"payload": base64.b64encode(payload).decode()}}
+
+
+class TestWsAuthGating:
+    def _run(self, monkeypatch, messages):
+        conn = _FakeDGConn()
+        monkeypatch.setattr(server, "dg_client", _FakeDGClient(conn))
+        server.handle_ws(_FakeWS(messages))
+        return conn
+
+    def test_media_before_start_never_reaches_stt(self, monkeypatch):
+        conn = self._run(monkeypatch, [_media(), _media(), {"event": "stop"}])
+        assert conn.media_frames == []
+        assert conn.closed is True
+
+    def test_media_after_invalid_start_never_reaches_stt(self, monkeypatch):
+        start = {"event": "start",
+                 "start": {"streamSid": "MZ1", "callSid": "CA1",
+                           "customParameters": {"token": "forged"}}}
+        conn = self._run(monkeypatch, [start, _media()])
+        assert conn.media_frames == []
+
+    def test_media_after_valid_start_reaches_stt(self, monkeypatch):
+        token = server._issue_stream_token("CA1")
+        start = {"event": "start",
+                 "start": {"streamSid": "MZ1", "callSid": "CA1",
+                           "customParameters": {"token": token}}}
+        conn = self._run(monkeypatch, [start, _media(b"hello"), {"event": "stop"}])
+        assert conn.media_frames == [b"hello"]

@@ -802,7 +802,6 @@ def _accumulate_stt_message(msg, transcript_buf):
     return bool(sf) or (sf is None and bool(getattr(msg, "is_final", False)))
 
 
-@webhook_sock.route("/ws/call")
 def handle_ws(ws):
     """Bi-directional audio: Twilio ↔ Deepgram STT ↔ LLM ↔ TTS."""
     print("🔌 WebSocket connected")
@@ -835,22 +834,26 @@ def handle_ws(ws):
         dg_conn.on(EventType.MESSAGE, on_message)
 
     try:
+        authenticated = False
         while True:
             data = ws.receive(timeout=30)
             if data is None:
                 continue  # receive timeout (silence/hold) — keep the session alive
             msg = json.loads(data)
             if msg["event"] == "start":
+                params = msg["start"].get("customParameters") or {}
+                if not _redeem_stream_token(params.get("token"), msg["start"].get("callSid")):
+                    print(f"⛔ /ws/call rejected: missing/invalid stream token ({msg['start'].get('callSid')})")
+                    break
+                authenticated = True
                 stream_sid = msg["start"]["streamSid"]
                 call_sid = msg["start"]["callSid"]
-                params = msg["start"].get("customParameters") or {}
-                if not _redeem_stream_token(params.get("token"), call_sid):
-                    print(f"⛔ /ws/call rejected: missing/invalid stream token ({call_sid})")
-                    break
             elif msg["event"] == "media":
-                audio = base64.b64decode(msg["media"]["payload"])
-                if dg_conn:
-                    dg_conn.send_media(audio)
+                # Gate on auth: Twilio always sends start first, so only a
+                # direct (unauthenticated) connection hits this before start —
+                # don't let it burn STT quota.
+                if authenticated and dg_conn:
+                    dg_conn.send_media(base64.b64decode(msg["media"]["payload"]))
             elif msg["event"] == "stop":
                 break
 
@@ -873,6 +876,11 @@ def handle_ws(ws):
         if dg_conn:
             dg_conn.close()
         print("🔌 WebSocket closed")
+
+
+# Registered via call (not decorator): flask-sock's route decorator returns
+# None, which would rebind handle_ws and make it untestable.
+webhook_sock.route("/ws/call")(handle_ws)
 
 _health_cache = {"data": None, "ts": 0}
 _HEALTH_TTL = 30  # seconds

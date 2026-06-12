@@ -213,10 +213,12 @@ class NativeTTS:
     """Zero-dependency fallback using macOS AVSpeechSynthesizer."""
 
     def synthesize_for_twilio(self, text: str) -> bytes:
-        """Synthesize using macOS native TTS. Returns PCM16 at 8kHz.
+        """Always returns silence.
 
-        Not implemented: AVSpeechSynthesizer has no straightforward
-        bytes-output path, so this engine always falls back to silence.
+        AVSpeechSynthesizer has no direct PCM-bytes output path without a
+        subprocess; this engine exists only as a last-resort fallback so
+        VoiceEngine initialisation doesn't fail when nothing else is
+        available.
         """
         return b""
 

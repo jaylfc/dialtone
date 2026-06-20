@@ -30,3 +30,6 @@ voicemails/
 .playwright-mcp/
 /dash-dark.png
 /dash-light.png
+
+# Multi-user accounts (password hashes)
+users.json

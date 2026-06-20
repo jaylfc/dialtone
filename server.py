@@ -33,8 +33,10 @@ from provider_registry import PROVIDER_DEPS, check_provider_installed, get_provi
 # Agent backend (lazy-loaded)
 from agents import get_agent_backend
 
+import accounts  # multi-user dashboard accounts (Phase 1)
+
 import requests as http_requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, g
 from flask_sock import Sock
 from twilio.rest import Client as TwilioClient
 from twilio.request_validator import RequestValidator
@@ -116,22 +118,63 @@ SESSION_TTL = 86400 * 30  # 30 days
 dashboard_sessions = {}
 
 
-def _new_session():
+# A token / first-run login authenticates as this synthetic admin (no user record).
+# mailbox "*" means "sees every mailbox".
+TOKEN_ADMIN = {"id": "__token__", "username": "admin", "display_name": "Administrator",
+               "role": "admin", "extension": "", "mailbox": "*", "active": True}
+
+
+def _new_session(user_id=None):
+    """Create a session. user_id=None is a token / first-run admin session."""
     sid = secrets.token_urlsafe(32)
-    dashboard_sessions[sid] = time.time()
+    dashboard_sessions[sid] = {"user_id": user_id, "created": time.time()}
     return sid
 
 
-def _session_valid(sid):
+def _session_record(sid):
     if not sid:
-        return False
-    created = dashboard_sessions.get(sid)
-    if created is None:
-        return False
+        return None
+    rec = dashboard_sessions.get(sid)
+    if rec is None:
+        return None
+    created = rec["created"] if isinstance(rec, dict) else rec  # tolerate legacy float
     if time.time() - created > SESSION_TTL:
         dashboard_sessions.pop(sid, None)
-        return False
-    return True
+        return None
+    return rec if isinstance(rec, dict) else {"user_id": None, "created": rec}
+
+
+def _session_valid(sid):
+    return _session_record(sid) is not None
+
+
+def _current_user():
+    """Resolve the authenticated user for this request, or None.
+
+    Order: session cookie -> first-run open -> Bearer/?token. A token match (or
+    first run with no token and no users) authenticates as TOKEN_ADMIN, so
+    existing single-token deployments keep working unchanged. The Bearer/?token
+    paths are gated on DASHBOARD_TOKEN being set, so an install that adds users
+    but no token cannot be bypassed with an empty token.
+    """
+    rec = _session_record(request.cookies.get(AUTH_COOKIE, ""))
+    if rec is not None:
+        uid = rec.get("user_id")
+        if uid:
+            u = accounts.get(uid)
+            return u if (u and u.get("active", True)) else None
+        return TOKEN_ADMIN
+    if not DASHBOARD_TOKEN and accounts.count() == 0:
+        return TOKEN_ADMIN  # first run, nothing configured
+    if DASHBOARD_TOKEN:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], DASHBOARD_TOKEN):
+            return TOKEN_ADMIN
+        token = request.args.get("token", "")
+        if token and hmac.compare_digest(token, DASHBOARD_TOKEN):
+            request._issue_session = True
+            return TOKEN_ADMIN
+    return None
 
 # Webhook URL override (use if behind a proxy or different URL)
 WEBHOOK_URL_OVERRIDE = env("WEBHOOK_URL_OVERRIDE")
@@ -248,6 +291,41 @@ def _record_pin_fail(caller):
         count, first = 0, time.time()
     pin_attempts[caller] = (count + 1, first)
 
+
+# Dashboard login rate-limiting (reuses the PIN lockout window/threshold).
+login_attempts = {}
+
+
+def _login_locked(key):
+    rec = login_attempts.get(key)
+    if not rec:
+        return False
+    count, first = rec
+    if time.time() - first > PIN_LOCKOUT_WINDOW:
+        login_attempts.pop(key, None)
+        return False
+    return count >= PIN_MAX_ATTEMPTS
+
+
+def _record_login_fail(key):
+    count, first = login_attempts.get(key, (0, time.time()))
+    if time.time() - first > PIN_LOCKOUT_WINDOW:
+        count, first = 0, time.time()
+    login_attempts[key] = (count + 1, first)
+
+
+# Trust X-Forwarded-For only from a local reverse proxy; otherwise it is
+# attacker-controlled and would let a brute-forcer rotate the rate-limit key.
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+
+
+def _client_ip():
+    peer = request.remote_addr or "?"
+    if peer in TRUSTED_PROXIES:
+        return request.headers.get("X-Forwarded-For", peer).split(",")[0].strip()
+    return peer
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Auth helpers (dashboard only)
 # ═══════════════════════════════════════════════════════════════════
@@ -276,7 +354,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .login-card .sub{text-align:center;color:#888;font-size:14px;margin-bottom:32px}
 .fg{margin-bottom:20px}
 .fg label{display:block;font-size:13px;color:#888;margin-bottom:6px;font-weight:500}
-.fg input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#111;color:#e0e0e0;font-size:15px;font-family:monospace;letter-spacing:2px;text-align:center}
+.fg input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#111;color:#e0e0e0;font-size:15px}
 .fg input:focus{outline:none;border-color:#3b82f6}
 .btn{width:100%;padding:12px;border-radius:8px;border:none;background:#1d4ed8;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
 .btn:hover{background:#2563eb}
@@ -285,26 +363,39 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style></head><body>
 <div class="login-card">
 <h1>📞 Dialtone</h1>
-<div class="sub">Enter your dashboard token</div>
-<div class="error" id="error">Invalid token</div>
+<div class="sub">Sign in to your dashboard</div>
+<div class="error" id="error">Invalid credentials</div>
 <form onsubmit="return doLogin(event)">
-<div class="fg"><label>Access Token</label><input type="password" id="token" placeholder="••••••••••••••••" autofocus></div>
-<button type="submit" class="btn">🔓 Login</button>
+<div class="fg"><label>Username</label><input type="text" id="username" placeholder="leave blank for token login" autocomplete="username" autofocus></div>
+<div class="fg"><label>Password</label><input type="password" id="password" placeholder="password or dashboard token" autocomplete="current-password"></div>
+<button type="submit" class="btn">Sign in</button>
 </form>
-<div class="hint">Find the token in your .env as DASHBOARD_TOKEN</div>
+<div class="hint">Single-operator setup? Leave username blank and enter your DASHBOARD_TOKEN.</div>
 </div>
 <script>
 async function doLogin(e){
 e.preventDefault();
-const t=document.getElementById('token').value;
-if(!t)return false;
+const u=document.getElementById('username').value.trim();
+const p=document.getElementById('password').value;
+if(!p)return false;
 try{
-const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
 const d=await r.json();
 if(d.status==='ok'){window.location='/'}else{document.getElementById('error').style.display='block'}
 }catch(e){document.getElementById('error').style.display='block'}
 return false}
 </script></body></html>"""
+
+def _is_admin_only(path):
+    """Surfaces that require an admin role."""
+    if path.startswith("/api/users"):
+        return True
+    if path.startswith("/api/providers/install"):
+        return True
+    if path == "/api/settings" and request.method in ("POST", "PUT", "PATCH"):
+        return True
+    return False
+
 
 # Dashboard auth middleware
 @dashboard_app.before_request
@@ -312,23 +403,14 @@ def require_dashboard_auth():
     path = request.path
     if path in ("/login", "/logout", "/health"):
         return None
-    if not DASHBOARD_TOKEN:
-        return None  # No token configured = open (first run)
-    # Valid session cookie?
-    if _session_valid(request.cookies.get(AUTH_COOKIE, "")):
-        return None
-    # Authorization: Bearer <token> (API clients)
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer ") and check_auth(auth[7:]):
-        return None
-    # One-time ?token= bootstrap (e.g. menubar) → a session cookie is issued below
-    token = request.args.get("token", "")
-    if token and check_auth(token):
-        request._issue_session = True
-        return None
-    if path.startswith("/api/"):
-        return jsonify({"error": "Unauthorized"}), 401
-    return Response(LOGIN_HTML, mimetype="text/html", status=401)
+    g.user = _current_user()
+    if g.user is None:
+        if path.startswith("/api/"):
+            return jsonify({"error": "Unauthorized"}), 401
+        return Response(LOGIN_HTML, mimetype="text/html", status=401)
+    if _is_admin_only(path) and g.user.get("role") != "admin":
+        return jsonify({"error": "Forbidden", "detail": "admin access required"}), 403
+    return None
 
 # ═══════════════════════════════════════════════════════════════════
 # Shared state
@@ -860,13 +942,26 @@ def health():
 def login():
     if request.method == "POST":
         data = request.json or {}
-        token = data.get("token", "")
-        if check_auth(token):
-            resp = jsonify({"status": "ok"})
-            resp.set_cookie(AUTH_COOKIE, _new_session(), httponly=True,
-                            samesite="Strict", secure=request.is_secure, max_age=SESSION_TTL)
-            return resp
-        return jsonify({"status": "error"}), 401
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or data.get("token") or ""
+        # Lock per-account when a username is supplied (cannot be bypassed by
+        # rotating IPs/headers); fall back to the trusted client IP for token logins.
+        lock_key = ("user:" + username.lower()) if username else ("ip:" + _client_ip())
+        if _login_locked(lock_key):
+            return jsonify({"status": "error", "detail": "too many attempts, try later"}), 429
+        user, uid = None, None
+        if username:
+            user = accounts.verify(username, password)
+            uid = user["id"] if user else None
+        elif password and DASHBOARD_TOKEN and hmac.compare_digest(password, DASHBOARD_TOKEN):
+            user = TOKEN_ADMIN  # back-compat: dashboard token in the password field
+        if user is None:
+            _record_login_fail(lock_key)
+            return jsonify({"status": "error"}), 401
+        resp = jsonify({"status": "ok", "user": {"username": user["username"], "role": user["role"]}})
+        resp.set_cookie(AUTH_COOKIE, _new_session(uid), httponly=True,
+                        samesite="Strict", secure=request.is_secure, max_age=SESSION_TTL)
+        return resp
     return Response(LOGIN_HTML, mimetype="text/html")
 
 @dashboard_app.route("/logout", methods=["GET"])
@@ -875,6 +970,38 @@ def logout():
     resp = Response('<script>window.location="/login";</script>', mimetype="text/html")
     resp.delete_cookie(AUTH_COOKIE)
     return resp
+
+@dashboard_app.route("/api/me", methods=["GET"])
+def api_me():
+    return jsonify(g.user)
+
+@dashboard_app.route("/api/users", methods=["GET", "POST"])
+def api_users():
+    if request.method == "POST":
+        d = request.json or {}
+        try:
+            user = accounts.create(
+                d.get("username"), d.get("password"),
+                display_name=d.get("display_name", ""), role=d.get("role", "user"),
+                extension=d.get("extension", ""), mailbox=d.get("mailbox", ""))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(user), 201
+    return jsonify(accounts.list_users())
+
+@dashboard_app.route("/api/users/<uid>", methods=["PATCH", "DELETE"])
+def api_user(uid):
+    if request.method == "DELETE":
+        if uid == g.user.get("id"):
+            return jsonify({"error": "cannot delete your own account"}), 400
+        return jsonify({"status": "ok"}) if accounts.delete(uid) else (jsonify({"error": "not found"}), 404)
+    d = request.json or {}
+    allowed = {k: d[k] for k in ("display_name", "role", "extension", "mailbox", "active", "password") if k in d}
+    try:
+        user = accounts.update(uid, **allowed)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(user) if user else (jsonify({"error": "not found"}), 404)
 
 @dashboard_app.route("/call", methods=["POST"])
 def make_call():
@@ -906,15 +1033,28 @@ def make_call():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _vm_visible(vm):
+    """Whether the current user may see/act on this voicemail (admins: all)."""
+    mailbox = (getattr(g, "user", None) or {}).get("mailbox", "*")
+    return mailbox == "*" or vm.get("mailbox", "general") == mailbox
+
+
+def _visible_voicemails():
+    return [vm for vm in load_voicemails() if _vm_visible(vm)]
+
+
 @dashboard_app.route("/voicemails", methods=["GET"])
 def list_voicemails():
-    return jsonify(load_voicemails())
+    return jsonify(_visible_voicemails())
 
 @dashboard_app.route("/voicemails/<sid>", methods=["DELETE"])
 def delete_voicemail(sid):
     with _vm_lock:
-        voicemails = [vm for vm in load_voicemails() if vm.get("sid") != sid]
-        save_voicemails(voicemails)
+        vms = load_voicemails()
+        vm = next((v for v in vms if v.get("sid") == sid), None)
+        if vm is None or not _vm_visible(vm):
+            return jsonify({"error": "not found"}), 404  # don't leak existence
+        save_voicemails([v for v in vms if v.get("sid") != sid])
     audio_path = AUDIO_DIR / f"{sid}.wav"
     if audio_path.exists():
         audio_path.unlink()
@@ -922,10 +1062,13 @@ def delete_voicemail(sid):
 
 @dashboard_app.route("/voicemails/<sid>/audio", methods=["GET"])
 def serve_voicemail_audio(sid):
+    vm = next((v for v in load_voicemails() if v.get("sid") == sid), None)
+    if vm is None or not _vm_visible(vm):
+        return jsonify({"error": "not found"}), 404  # scope before touching the file
     audio_path = AUDIO_DIR / f"{sid}.wav"
-    if audio_path.exists():
-        return Response(audio_path.read_bytes(), mimetype="audio/wav")
-    return jsonify({"error": "Audio not found"}), 404
+    if not audio_path.exists():
+        return jsonify({"error": "not found"}), 404
+    return Response(audio_path.read_bytes(), mimetype="audio/wav")
 
 # ═══════════════════════════════════════════════════════════════════
 # Settings API
@@ -1180,7 +1323,7 @@ def list_models():
 @dashboard_app.route("/export/zip", methods=["GET"])
 def export_zip():
     import zipfile, io
-    voicemails = load_voicemails()
+    voicemails = _visible_voicemails()
     if not voicemails:
         return jsonify({"error": "No voicemails to export"}), 404
     buffer = io.BytesIO()
@@ -1206,8 +1349,8 @@ def export_zip():
 
 @dashboard_app.route("/export/transcripts", methods=["GET"])
 def export_transcripts():
-    voicemails = load_voicemails()
-    lines = [f"Dialtone — Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
+    voicemails = _visible_voicemails()
+    lines = [f"Dialtone - Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
     for vm in voicemails:
         caller = vm.get("from", "unknown").replace("+", "")
         lines.append(f"From: {caller}")
@@ -1224,7 +1367,7 @@ def export_transcripts():
 def set_auth_cookie_from_token(response):
     """Issue a session cookie after a successful ?token= bootstrap."""
     if getattr(request, "_issue_session", False):
-        response.set_cookie(AUTH_COOKIE, _new_session(), httponly=True,
+        response.set_cookie(AUTH_COOKIE, _new_session(None), httponly=True,
                             samesite="Strict", secure=request.is_secure, max_age=SESSION_TTL)
     return response
 # ═══════════════════════════════════════════════════════════════════

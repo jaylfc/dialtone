@@ -314,6 +314,18 @@ def _record_login_fail(key):
     login_attempts[key] = (count + 1, first)
 
 
+# Trust X-Forwarded-For only from a local reverse proxy; otherwise it is
+# attacker-controlled and would let a brute-forcer rotate the rate-limit key.
+TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+
+
+def _client_ip():
+    peer = request.remote_addr or "?"
+    if peer in TRUSTED_PROXIES:
+        return request.headers.get("X-Forwarded-For", peer).split(",")[0].strip()
+    return peer
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Auth helpers (dashboard only)
 # ═══════════════════════════════════════════════════════════════════
@@ -932,8 +944,10 @@ def login():
         data = request.json or {}
         username = (data.get("username") or "").strip()
         password = data.get("password") or data.get("token") or ""
-        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
-        if _login_locked(ip):
+        # Lock per-account when a username is supplied (cannot be bypassed by
+        # rotating IPs/headers); fall back to the trusted client IP for token logins.
+        lock_key = ("user:" + username.lower()) if username else ("ip:" + _client_ip())
+        if _login_locked(lock_key):
             return jsonify({"status": "error", "detail": "too many attempts, try later"}), 429
         user, uid = None, None
         if username:
@@ -942,7 +956,7 @@ def login():
         elif password and DASHBOARD_TOKEN and hmac.compare_digest(password, DASHBOARD_TOKEN):
             user = TOKEN_ADMIN  # back-compat: dashboard token in the password field
         if user is None:
-            _record_login_fail(ip)
+            _record_login_fail(lock_key)
             return jsonify({"status": "error"}), 401
         resp = jsonify({"status": "ok", "user": {"username": user["username"], "role": user["role"]}})
         resp.set_cookie(AUTH_COOKIE, _new_session(uid), httponly=True,
@@ -1019,19 +1033,28 @@ def make_call():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _vm_visible(vm):
+    """Whether the current user may see/act on this voicemail (admins: all)."""
+    mailbox = (getattr(g, "user", None) or {}).get("mailbox", "*")
+    return mailbox == "*" or vm.get("mailbox", "general") == mailbox
+
+
+def _visible_voicemails():
+    return [vm for vm in load_voicemails() if _vm_visible(vm)]
+
+
 @dashboard_app.route("/voicemails", methods=["GET"])
 def list_voicemails():
-    vms = load_voicemails()
-    mailbox = (getattr(g, "user", None) or {}).get("mailbox", "*")
-    if mailbox != "*":  # admins ("*") see all; users see only their mailbox
-        vms = [vm for vm in vms if vm.get("mailbox", "general") == mailbox]
-    return jsonify(vms)
+    return jsonify(_visible_voicemails())
 
 @dashboard_app.route("/voicemails/<sid>", methods=["DELETE"])
 def delete_voicemail(sid):
     with _vm_lock:
-        voicemails = [vm for vm in load_voicemails() if vm.get("sid") != sid]
-        save_voicemails(voicemails)
+        vms = load_voicemails()
+        vm = next((v for v in vms if v.get("sid") == sid), None)
+        if vm is None or not _vm_visible(vm):
+            return jsonify({"error": "not found"}), 404  # don't leak existence
+        save_voicemails([v for v in vms if v.get("sid") != sid])
     audio_path = AUDIO_DIR / f"{sid}.wav"
     if audio_path.exists():
         audio_path.unlink()
@@ -1039,10 +1062,13 @@ def delete_voicemail(sid):
 
 @dashboard_app.route("/voicemails/<sid>/audio", methods=["GET"])
 def serve_voicemail_audio(sid):
+    vm = next((v for v in load_voicemails() if v.get("sid") == sid), None)
+    if vm is None or not _vm_visible(vm):
+        return jsonify({"error": "not found"}), 404  # scope before touching the file
     audio_path = AUDIO_DIR / f"{sid}.wav"
-    if audio_path.exists():
-        return Response(audio_path.read_bytes(), mimetype="audio/wav")
-    return jsonify({"error": "Audio not found"}), 404
+    if not audio_path.exists():
+        return jsonify({"error": "not found"}), 404
+    return Response(audio_path.read_bytes(), mimetype="audio/wav")
 
 # ═══════════════════════════════════════════════════════════════════
 # Settings API
@@ -1297,7 +1323,7 @@ def list_models():
 @dashboard_app.route("/export/zip", methods=["GET"])
 def export_zip():
     import zipfile, io
-    voicemails = load_voicemails()
+    voicemails = _visible_voicemails()
     if not voicemails:
         return jsonify({"error": "No voicemails to export"}), 404
     buffer = io.BytesIO()
@@ -1323,8 +1349,8 @@ def export_zip():
 
 @dashboard_app.route("/export/transcripts", methods=["GET"])
 def export_transcripts():
-    voicemails = load_voicemails()
-    lines = [f"Dialtone — Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
+    voicemails = _visible_voicemails()
+    lines = [f"Dialtone - Voicemail Transcripts", f"Exported: {datetime.now().isoformat()}", "=" * 50, ""]
     for vm in voicemails:
         caller = vm.get("from", "unknown").replace("+", "")
         lines.append(f"From: {caller}")

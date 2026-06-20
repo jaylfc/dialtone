@@ -104,3 +104,45 @@ class TestAuth:
         accounts.create("alice", "pw", role="user", mailbox="alice")
         c.post("/login", json={"username": "alice", "password": "pw"})
         assert [v["sid"] for v in c.get("/voicemails").get_json()] == ["A"]  # only her mailbox
+
+
+class TestVoicemailAuthz:
+    """Every voicemail route is mailbox-scoped (not just the list) — IDOR guard."""
+
+    def _alice(self, monkeypatch, tmp_path):
+        c = _client(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "load_voicemails", lambda: [
+            {"sid": "A", "mailbox": "alice", "from": "+111", "transcript": "ALICEVM"},
+            {"sid": "B", "mailbox": "bob", "from": "+222", "transcript": "BOBVM"}])
+        monkeypatch.setattr(server, "save_voicemails", lambda vms: None)
+        accounts.create("alice", "pw", role="user", mailbox="alice")
+        c.post("/login", json={"username": "alice", "password": "pw"})
+        return c
+
+    def test_cannot_delete_other_mailbox(self, monkeypatch, tmp_path):
+        c = self._alice(monkeypatch, tmp_path)
+        assert c.delete("/voicemails/B").status_code == 404   # bob's -> hidden
+        assert c.delete("/voicemails/A").status_code == 200   # her own
+
+    def test_cannot_fetch_other_mailbox_audio(self, monkeypatch, tmp_path):
+        c = self._alice(monkeypatch, tmp_path)
+        assert c.get("/voicemails/B/audio").status_code == 404  # scoped before file check
+
+    def test_export_is_scoped(self, monkeypatch, tmp_path):
+        c = self._alice(monkeypatch, tmp_path)
+        body = c.get("/export/transcripts").get_data(as_text=True)
+        assert "ALICEVM" in body and "BOBVM" not in body
+
+
+class TestLoginRateLimit:
+    def test_account_lockout_survives_ip_spoof(self, monkeypatch, tmp_path):
+        c = _client(monkeypatch, tmp_path)
+        accounts.create("alice", "pw")
+        for i in range(server.PIN_MAX_ATTEMPTS):  # rotate the spoofable header each time
+            r = c.post("/login", json={"username": "alice", "password": "wrong"},
+                       headers={"X-Forwarded-For": f"9.9.9.{i}"})
+            assert r.status_code == 401
+        # keyed on the account, not the (spoofed) IP -> still locked
+        r = c.post("/login", json={"username": "alice", "password": "wrong"},
+                   headers={"X-Forwarded-For": "9.9.9.250"})
+        assert r.status_code == 429
